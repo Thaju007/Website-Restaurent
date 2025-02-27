@@ -969,3 +969,45 @@ if __name__ == "__main__":
     
     # Generate 200 million synthetic records
     generate_tabular_data(data_path, output_path, num_samples=200_000_000)
+
+
+## Example date preprocessing
+def preprocess_date_columns(df, date_columns):
+    for col in date_columns:
+        # Convert to datetime if not already
+        df[col] = pd.to_datetime(df[col])
+        
+        # Extract components as new features
+        df[f'{col}_year'] = df[col].dt.year
+        df[f'{col}_month'] = df[col].dt.month
+        df[f'{col}_day'] = df[col].dt.day
+        df[f'{col}_dayofweek'] = df[col].dt.dayofweek
+        
+        # Optionally add cyclical encoding for month and day of week
+        df[f'{col}_month_sin'] = np.sin(2 * np.pi * df[col].dt.month / 12)
+        df[f'{col}_month_cos'] = np.cos(2 * np.pi * df[col].dt.month / 12)
+        
+        # Drop original date column
+        df = df.drop(columns=[col])
+    
+    return df
+
+# In the load_and_preprocess_data function
+date_columns = ['date_column1', 'date_column2']  # List your date columns here
+df = preprocess_date_columns(df, date_columns)
+
+# In post-processing
+def reconstruct_dates(df, date_columns):
+    for col in date_columns:
+        # Reconstruct date from components
+        df[col] = pd.to_datetime({
+            'year': df[f'{col}_year'],
+            'month': df[f'{col}_month'],
+            'day': df[f'{col}_day']
+        })
+        
+        # Drop component columns
+        df = df.drop(columns=[f'{col}_year', f'{col}_month', f'{col}_day', 
+                              f'{col}_dayofweek', f'{col}_month_sin', f'{col}_month_cos'])
+    
+    return df
