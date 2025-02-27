@@ -1011,3 +1011,34 @@ def reconstruct_dates(df, date_columns):
                               f'{col}_dayofweek', f'{col}_month_sin', f'{col}_month_cos'])
     
     return df
+def decode_cyclical_feature(sin_value, cos_value, max_value):
+    """
+    Decode a cyclical feature from sine and cosine encoding
+    
+    Parameters:
+    sin_value: The sine component of the encoding
+    cos_value: The cosine component of the encoding
+    max_value: The maximum value of the original feature (e.g., 7 for days of week, 12 for months)
+    
+    Returns:
+    The decoded original value (may need rounding for integer features)
+    """
+    # Get the angle in radians using atan2
+    angle = np.arctan2(sin_value, cos_value)
+    
+    # Convert negative angles to positive (atan2 returns angles in [-π, π])
+    if angle < 0:
+        angle += 2 * np.pi
+    
+    # Convert from [0, 2π] to [0, max_value]
+    decoded_value = (angle / (2 * np.pi)) * max_value
+    
+    # For day of month or month, round to nearest integer
+    # For features where the original value starts from 1 (like months), add 1
+    decoded_value = np.round(decoded_value)
+    
+    # Handle edge case where rounding gives max_value instead of 0
+    if decoded_value == max_value:
+        decoded_value = 0
+        
+    return decoded_value
