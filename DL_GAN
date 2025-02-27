@@ -1,0 +1,357 @@
+import torch
+import numpy as np
+import os
+import h5py
+from torch.utils.data import Dataset, DataLoader
+import time
+from tqdm import tqdm
+import multiprocessing as mp
+import argparse
+
+# ======================================================================
+# CONFIGURATION SETTINGS
+# ======================================================================
+
+# Default settings - these can be overridden via command line arguments
+# We define them here for easy access in procedural functions
+TOTAL_SAMPLES = 200000000  # 200 million total samples to generate
+BATCH_SIZE = 1000000      # Generate 1M samples at a time to balance memory usage and efficiency
+FEATURE_DIM = 100         # Dimension of feature vectors
+NUM_CLASSES = 10          # Number of target classes 
+OUTPUT_DIR = 'synthetic_data'  # Where to store generated data
+NUM_PROCESSES = mp.cpu_count()  # Default to using all available CPU cores
+
+# ======================================================================
+# COMMAND LINE ARGUMENT PARSING
+# ======================================================================
+
+def parse_arguments():
+    """
+    Parse command line arguments to customize data generation.
+    Allows users to adjust parameters without changing code.
+    """
+    parser = argparse.ArgumentParser(description='Generate synthetic data efficiently with PyTorch')
+    parser.add_argument('--total_samples', type=int, default=TOTAL_SAMPLES, 
+                        help='Total number of samples to generate')
+    parser.add_argument('--batch_size', type=int, default=BATCH_SIZE, 
+                        help='Batch size for generation (higher = faster but more memory)')
+    parser.add_argument('--feature_dim', type=int, default=FEATURE_DIM, 
+                        help='Dimension of features')
+    parser.add_argument('--num_classes', type=int, default=NUM_CLASSES, 
+                        help='Number of target classes')
+    parser.add_argument('--output_dir', type=str, default=OUTPUT_DIR, 
+                        help='Output directory for generated data')
+    parser.add_argument('--num_processes', type=int, default=NUM_PROCESSES, 
+                        help='Number of parallel processes (default: all CPU cores)')
+    return parser.parse_args()
+
+# ======================================================================
+# FILE AND DIRECTORY UTILITIES
+# ======================================================================
+
+def create_output_directory(output_dir):
+    """
+    Create the output directory if it doesn't exist.
+    Ensures we have a place to save generated data without errors.
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created directory: {output_dir}")
+
+# ======================================================================
+# DATA GENERATION FUNCTIONS
+# ======================================================================
+
+def setup_generation_parameters(feature_dim, num_classes, device):
+    """
+    Create parameters for generating synthetic data.
+    
+    We create two key components:
+    1. Feature weights: Each class has its own pattern/template
+    2. Noise scales: Each class has varying levels of noise for realism
+    
+    Args:
+        feature_dim: Dimension of feature vectors
+        num_classes: Number of target classes
+        device: Computing device (CPU/GPU)
+        
+    Returns:
+        Dictionary containing generation parameters
+    """
+    # Generate random feature weights for each class
+    # This gives each class a unique pattern/signature in the feature space
+    feature_weights = torch.randn(num_classes, feature_dim, device=device)
+    
+    # Create varying noise scales for each class (between 0.5 and 1.0)
+    # This makes the data more realistic by having varying tightness of clusters
+    noise_scales = torch.rand(num_classes, device=device) * 0.5 + 0.5
+    
+    return {
+        'feature_weights': feature_weights,
+        'noise_scales': noise_scales
+    }
+
+def generate_batch(batch_size, feature_dim, num_classes, gen_params, device):
+    """
+    Generate a batch of synthetic data.
+    
+    This function creates synthetic data by:
+    1. Generating random class labels
+    2. Creating base random features
+    3. Adding class-specific patterns and controlled noise
+    
+    Using tensor operations for efficiency rather than loops where possible.
+    
+    Args:
+        batch_size: Number of samples to generate
+        feature_dim: Dimension of feature vectors
+        num_classes: Number of target classes
+        gen_params: Generation parameters from setup_generation_parameters
+        device: Computing device (CPU/GPU)
+        
+    Returns:
+        features: Tensor of shape (batch_size, feature_dim)
+        labels: Tensor of shape (batch_size,)
+    """
+    # Get generation parameters
+    feature_weights = gen_params['feature_weights']
+    noise_scales = gen_params['noise_scales']
+    
+    # Generate random class labels (integers from 0 to num_classes-1)
+    # Using random labels gives a balanced dataset by default
+    labels = torch.randint(0, num_classes, (batch_size,), device=device)
+    
+    # Start with random Gaussian noise as the base features
+    # This creates a natural distribution in the feature space
+    features = torch.randn(batch_size, feature_dim, device=device)
+    
+    # For each class, modify its samples to follow class-specific patterns
+    for i in range(num_classes):
+        # Create a boolean mask for samples of this class
+        mask = (labels == i)
+        
+        # Only proceed if we have samples of this class in the batch
+        if mask.sum() > 0:
+            class_size = mask.sum().item()
+            
+            # Add the class-specific pattern/weights to make samples cluster by class
+            # We use unsqueeze and repeat to efficiently apply the same weights to all samples
+            features[mask] += feature_weights[i].unsqueeze(0).repeat(class_size, 1)
+            
+            # Add class-specific noise to create more realistic, varied data
+            # Different classes have different noise scales for more diversity
+            features[mask] += torch.randn(class_size, feature_dim, device=device) * noise_scales[i]
+    
+    return features, labels
+
+def save_batch_to_file(batch_idx, features, labels, output_dir):
+    """
+    Save a batch of generated data to an HDF5 file.
+    
+    HDF5 is used because:
+    1. It's efficient for large numerical datasets
+    2. Supports compression
+    3. Allows partial loading during training (memory efficiency)
+    
+    Args:
+        batch_idx: Batch index for filename
+        features: Feature tensor
+        labels: Label tensor
+        output_dir: Directory to save the file
+        
+    Returns:
+        filename: Path to the saved file
+    """
+    # Create a unique filename for this batch
+    filename = os.path.join(output_dir, f'synthetic_data_batch_{batch_idx}.h5')
+    
+    # Convert tensors to numpy arrays (required for HDF5) and store
+    with h5py.File(filename, 'w') as f:
+        # Move data to CPU if needed and convert to numpy
+        f.create_dataset('features', data=features.cpu().numpy())
+        f.create_dataset('labels', data=labels.cpu().numpy())
+    
+    return filename
+
+def generate_batch_process(batch_idx, batch_size, feature_dim, num_classes, output_dir):
+    """
+    Process function for parallel data generation.
+    
+    This function is designed to be run in a separate process.
+    Each process:
+    1. Sets up its own generation parameters
+    2. Generates a batch of data
+    3. Saves it to disk
+    
+    Args:
+        batch_idx: Index of the current batch
+        batch_size: Size of each batch
+        feature_dim: Dimension of features
+        num_classes: Number of classes
+        output_dir: Output directory
+    
+    Returns:
+        batch_idx: The processed batch index
+        filename: Path to the saved file
+    """
+    # Use CPU for multiprocessing to avoid CUDA conflicts between processes
+    device = torch.device('cpu')
+    
+    # Set up generation parameters for this process
+    gen_params = setup_generation_parameters(feature_dim, num_classes, device)
+    
+    # Generate data batch
+    features, labels = generate_batch(batch_size, feature_dim, num_classes, gen_params, device)
+    
+    # Save to file and return info
+    filename = save_batch_to_file(batch_idx, features, labels, output_dir)
+    
+    return batch_idx, filename
+
+# ======================================================================
+# DATA LOADING UTILITIES (for using the generated data)
+# ======================================================================
+
+def create_dataset(data_dir):
+    """
+    Create a PyTorch Dataset for the generated synthetic data.
+    
+    This allows efficient loading during training by:
+    1. Loading files on-demand rather than all at once
+    2. Supporting PyTorch's DataLoader for parallel loading
+    3. Enabling shuffling, batching, and other training optimizations
+    
+    Args:
+        data_dir: Directory containing the generated HDF5 files
+        
+    Returns:
+        dataset: PyTorch Dataset object
+    """
+    # Define a nested Dataset class - this is standard practice in PyTorch
+    class SyntheticDataset(Dataset):
+        def __init__(self, data_dir):
+            """
+            Initialize the dataset.
+            
+            Args:
+                data_dir: Directory containing HDF5 data files
+            """
+            self.data_dir = data_dir
+            # Get all HDF5 files in the directory
+            self.files = [f for f in os.listdir(data_dir) if f.endswith('.h5')]
+            
+            # Determine dataset size by looking at the first file
+            with h5py.File(os.path.join(data_dir, self.files[0]), 'r') as f:
+                self.samples_per_file = f['labels'].shape[0]
+            
+            # Calculate total samples across all files
+            self.total_samples = len(self.files) * self.samples_per_file
+        
+        def __len__(self):
+            """Return the total number of samples in the dataset."""
+            return self.total_samples
+        
+        def __getitem__(self, idx):
+            """
+            Get a specific sample from the dataset.
+            
+            This function:
+            1. Calculates which file contains the requested sample
+            2. Loads only that specific sample from disk
+            3. Converts it to a PyTorch tensor
+            
+            Args:
+                idx: Index of the sample
+                
+            Returns:
+                feature: Feature vector
+                label: Target label
+            """
+            # Determine which file and which position in that file
+            file_idx = idx // self.samples_per_file
+            sample_idx = idx % self.samples_per_file
+            
+            # Load just this sample from the file
+            with h5py.File(os.path.join(self.data_dir, self.files[file_idx]), 'r') as f:
+                feature = torch.tensor(f['features'][sample_idx], dtype=torch.float32)
+                label = torch.tensor(f['labels'][sample_idx], dtype=torch.long)
+                
+            return feature, label
+    
+    # Create and return an instance of the dataset
+    return SyntheticDataset(data_dir)
+
+# ======================================================================
+# MAIN EXECUTION FUNCTION
+# ======================================================================
+
+def generate_synthetic_data():
+    """Main function to generate synthetic data."""
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Determine the computing device (GPU if available, otherwise CPU)
+    device_type = 'CUDA' if torch.cuda.is_available() else 'CPU'
+    print(f"Using device: {device_type}")
+    print(f"Generating {args.total_samples} samples with {args.feature_dim} features and {args.num_classes} classes")
+    
+    # Create output directory for storing generated data
+    create_output_directory(args.output_dir)
+    
+    # Calculate number of batches needed to generate all samples
+    # We use batching to manage memory usage while still being efficient
+    num_batches = args.total_samples // args.batch_size
+    if args.total_samples % args.batch_size > 0:
+        num_batches += 1
+    
+    print(f"Generating {num_batches} batches with {args.batch_size} samples each")
+    start_time = time.time()
+    
+    # Generate data in parallel across multiple CPU cores
+    # This dramatically speeds up generation compared to sequential processing
+    print(f"Using {args.num_processes} processes for parallel data generation")
+    
+    # Setup multiprocessing pool and process batches in parallel
+    with mp.Pool(processes=args.num_processes) as pool:
+        # Map the generation function to batch indices and track progress with tqdm
+        results = list(tqdm(
+            pool.starmap(
+                generate_batch_process, 
+                [(i, args.batch_size, args.feature_dim, args.num_classes, args.output_dir) 
+                 for i in range(num_batches)]
+            ),
+            total=num_batches,
+            desc="Generating batches"
+        ))
+    
+    # Calculate and display elapsed time
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
+    print(f"Data generation completed in {elapsed_time:.2f} seconds")
+    print(f"Generated files are saved in the '{args.output_dir}' directory")
+    
+    # Demo how to use the generated data
+    print("\nDemo: Loading the generated data with PyTorch DataLoader")
+    
+    # Create a dataset from the generated files
+    dataset = create_dataset(args.output_dir)
+    
+    # Create a DataLoader for efficient batch loading during training
+    # num_workers=4 enables parallel loading of data
+    dataloader = DataLoader(dataset, batch_size=1000, shuffle=True, num_workers=4)
+    
+    # Load a sample batch and print statistics
+    batch = next(iter(dataloader))
+    features, labels = batch
+    print(f"Loaded batch - Features shape: {features.shape}, Labels shape: {labels.shape}")
+    print(f"Feature mean: {features.mean().item():.4f}, std: {features.std().item():.4f}")
+    print(f"Label distribution: {torch.bincount(labels)}")
+
+# ======================================================================
+# SCRIPT ENTRY POINT
+# ======================================================================
+
+# Execute the main function when script is run directly
+if __name__ == "__main__":
+    generate_synthetic_data()
