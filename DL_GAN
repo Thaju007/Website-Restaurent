@@ -1,1244 +1,322 @@
-import numpy as np
+import ast
+import symtable
+from collections import defaultdict
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, TensorDataset
-from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import OneHotEncoder
-import matplotlib.pyplot as plt
-from scipy.stats import norm
-import random
 import os
+import re
+import textwrap
+from anytree import Node, RenderTree
+from anytree.exporter import DotExporter
 
-# Set random seeds for reproducibility
-np.random.seed(42)
-torch.manual_seed(42)
-random.seed(42)
-
-# Check if CUDA is available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-
-#----------------------------------------------
-# 1. Mode-Specific Normalization for Continuous Columns
-#----------------------------------------------
-
-def fit_gmm(data, n_modes=3):
-    """
-    Fit a Gaussian Mixture Model to a continuous column.
-    
-    Parameters:
-    -----------
-    data : array-like
-        Continuous column values
-    n_modes : int
-        Number of Gaussian modes to fit
-        
-    Returns:
-    --------
-    dict
-        GMM parameters (means, stds, weights)
-    """
-    # Reshape for scikit-learn
-    X = np.array(data).reshape(-1, 1)
-    
-    # Fit GMM
-    gmm = GaussianMixture(
-        n_components=n_modes,
-        covariance_type='diag',
-        init_params='kmeans',
-        max_iter=100,
-        random_state=42
-    )
-    gmm.fit(X)
-    
-    # Extract parameters
-    means = gmm.means_.flatten()
-    stds = np.sqrt(gmm.covariances_.flatten())
-    weights = gmm.weights_
-    
-    return {
-        'means': means,
-        'stds': stds,
-        'weights': weights,
-        'gmm': gmm
-    }
-
-def transform_continuous(data, gmm_params):
-    """
-    Transform continuous data using mode-specific normalization.
-    
-    Parameters:
-    -----------
-    data : array-like
-        Continuous column values
-    gmm_params : dict
-        GMM parameters from fit_gmm
-        
-    Returns:
-    --------
-    tuple
-        (mode_one_hot, normalized_values)
-    """
-    X = np.array(data).reshape(-1, 1)
-    gmm = gmm_params['gmm']
-    means = gmm_params['means']
-    stds = gmm_params['stds']
-    
-    # Calculate probabilities
-    probs = gmm.predict_proba(X)
-    
-    # Sample modes based on probabilities
-    modes = []
-    normalized_values = []
-    
-    for i, x in enumerate(X):
-        # Sample a mode
-        mode = np.random.choice(len(means), p=probs[i])
-        modes.append(mode)
-        
-        # Normalize the value
-        normalized_value = (x[0] - means[mode]) / (4 * stds[mode])
-        normalized_values.append(normalized_value)
-    
-    # Convert modes to one-hot vectors
-    n_samples = len(data)
-    n_modes = len(means)
-    mode_one_hot = np.zeros((n_samples, n_modes))
-    mode_one_hot[np.arange(n_samples), modes] = 1
-    
-    return mode_one_hot, np.array(normalized_values)
-
-def inverse_transform_continuous(mode_one_hot, normalized_values, gmm_params):
-    """
-    Convert normalized values back to original scale.
-    
-    Parameters:
-    -----------
-    mode_one_hot : array-like
-        One-hot encoded modes
-    normalized_values : array-like
-        Normalized values
-    gmm_params : dict
-        GMM parameters from fit_gmm
-        
-    Returns:
-    --------
-    array-like
-        Original scale values
-    """
-    means = gmm_params['means']
-    stds = gmm_params['stds']
-    
-    # Get selected modes
-    modes = np.argmax(mode_one_hot, axis=1)
-    
-    # Denormalize values
-    original_values = normalized_values * (4 * stds[modes]) + means[modes]
-    
-    return original_values
-
-#----------------------------------------------
-# 2. Conditional Vector Generation
-#----------------------------------------------
-
-def fit_discrete_encoder(data):
-    """
-    Fit a one-hot encoder to discrete columns.
-    
-    Parameters:
-    -----------
-    data : pandas.DataFrame or dict
-        Data with discrete columns
-        
-    Returns:
-    --------
-    dict
-        Fitted encoders and column metadata
-    """
-    if isinstance(data, pd.DataFrame):
-        columns = list(data.columns)
-    else:
-        columns = list(data.keys())
-    
-    encoders = {}
-    metadata = {'n_categories': {}}
-    
-    for col in columns:
-        if isinstance(data, pd.DataFrame):
-            col_data = data[col].values.reshape(-1, 1)
+class FunctionAnalyzer:
+    def __init__(self, code_string=None, file_path=None):
+        """Initialize with either code string or file path"""
+        if file_path and os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                self.code_string = f.read()
+            self.source_name = os.path.basename(file_path)
+        elif code_string:
+            self.code_string = code_string
+            self.source_name = "<string>"
         else:
-            col_data = np.array(data[col]).reshape(-1, 1)
+            raise ValueError("Either code_string or valid file_path must be provided")
             
-        encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
-        encoder.fit(col_data)
+        # Parse the code
+        self.parsed = ast.parse(self.code_string)
+        self.functions = {}
+        self.class_functions = defaultdict(list)
+        self.module_vars = set()
+        self.trees = {}
         
-        encoders[col] = encoder
-        metadata['n_categories'][col] = len(encoder.categories_[0])
-    
-    metadata['total_categories'] = sum(metadata['n_categories'].values())
-    metadata['columns'] = columns
-    
-    return {
-        'encoders': encoders,
-        'metadata': metadata
-    }
-
-def transform_discrete(data, discrete_info):
-    """
-    Transform discrete columns to one-hot encoding.
-    
-    Parameters:
-    -----------
-    data : pandas.DataFrame or dict
-        Data with discrete columns
-    discrete_info : dict
-        Discrete encoders and metadata from fit_discrete_encoder
+    def analyze(self):
+        """Analyze code to find undefined variables and other metrics"""
+        # Extract module-level variables
+        for node in ast.walk(self.parsed):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.module_vars.add(target.id)
         
-    Returns:
-    --------
-    dict
-        One-hot encoded discrete columns
-    """
-    encoders = discrete_info['encoders']
-    columns = discrete_info['metadata']['columns']
-    
-    encoded = {}
-    
-    for col in columns:
-        if isinstance(data, pd.DataFrame):
-            col_data = data[col].values.reshape(-1, 1)
-        else:
-            col_data = np.array(data[col]).reshape(-1, 1)
+        # Analyze each function
+        for node in ast.walk(self.parsed):
+            if isinstance(node, ast.FunctionDef):
+                function_info = self._analyze_function(node)
+                self.functions[node.name] = function_info
+                
+                # Build function tree
+                self.trees[node.name] = self._build_function_tree(node)
             
-        encoded[col] = encoders[col].transform(col_data)
+            # Track class methods
+            elif isinstance(node, ast.ClassDef):
+                class_name = node.name
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        self.class_functions[class_name].append(item.name)
+        
+        return self.functions
     
-    return encoded
-
-def inverse_transform_discrete(encoded_data, discrete_info):
-    """
-    Convert one-hot encoded data back to categorical values.
-    
-    Parameters:
-    -----------
-    encoded_data : dict
-        One-hot encoded discrete columns
-    discrete_info : dict
-        Discrete encoders and metadata from fit_discrete_encoder
-        
-    Returns:
-    --------
-    dict
-        Categorical values
-    """
-    encoders = discrete_info['encoders']
-    columns = discrete_info['metadata']['columns']
-    
-    decoded = {}
-    
-    for col in columns:
-        # For each encoded column, inverse transform
-        # Handle the case where we might have probabilities instead of one-hot
-        if encoded_data[col].max() <= 1 and encoded_data[col].min() >= 0:
-            # Convert probabilities to one-hot by taking argmax
-            one_hot = np.zeros_like(encoded_data[col])
-            one_hot[np.arange(len(encoded_data[col])), np.argmax(encoded_data[col], axis=1)] = 1
-            decoded_col = encoders[col].inverse_transform(one_hot)
-        else:
-            decoded_col = encoders[col].inverse_transform(encoded_data[col])
-            
-        decoded[col] = decoded_col.flatten()
-    
-    return decoded
-
-def create_conditional_vector(discrete_info, column, value):
-    """
-    Create a conditional vector for a specific discrete value.
-    
-    Parameters:
-    -----------
-    discrete_info : dict
-        Discrete encoders and metadata
-    column : str
-        Column name
-    value : any
-        Value to condition on
-        
-    Returns:
-    --------
-    numpy.ndarray
-        Conditional vector
-    """
-    encoders = discrete_info['encoders']
-    metadata = discrete_info['metadata']
-    columns = metadata['columns']
-    
-    # Initialize mask vectors for all discrete columns
-    masks = {}
-    for col in columns:
-        masks[col] = np.zeros(metadata['n_categories'][col])
-    
-    # Set the specified value's position to 1
-    col_encoder = encoders[column]
-    value_encoded = col_encoder.transform([[value]])[0]
-    value_idx = np.argmax(value_encoded)
-    masks[column][value_idx] = 1
-    
-    # Concatenate all masks
-    cond_vector = np.concatenate([masks[col] for col in columns])
-    
-    return cond_vector
-
-def sample_log_frequency(data, column):
-    """
-    Sample a value from a column using log-frequency sampling.
-    
-    Parameters:
-    -----------
-    data : pandas.DataFrame
-        Data containing the column
-    column : str
-        Column name to sample from
-        
-    Returns:
-    --------
-    any
-        Sampled value
-    """
-    value_counts = data[column].value_counts()
-    values = value_counts.index.tolist()
-    
-    # Calculate log frequencies
-    log_freqs = np.log1p(value_counts.values)
-    probabilities = log_freqs / log_freqs.sum()
-    
-    # Sample a value
-    sampled_value = np.random.choice(values, p=probabilities)
-    
-    return sampled_value
-
-def sample_conditional_vector(data, discrete_info):
-    """
-    Sample a conditional vector according to the training-by-sampling method.
-    
-    Parameters:
-    -----------
-    data : pandas.DataFrame
-        Original data
-    discrete_info : dict
-        Discrete encoders and metadata
-        
-    Returns:
-    --------
-    tuple
-        (conditional_vector, selected_column, selected_value)
-    """
-    # Get columns
-    columns = discrete_info['metadata']['columns']
-    
-    # Step 1-2: Randomly select a discrete column
-    selected_column = random.choice(columns)
-    
-    # Step 3-4: Sample a value using log-frequency
-    selected_value = sample_log_frequency(data, selected_column)
-    
-    # Step 5-6: Create conditional vector
-    cond_vector = create_conditional_vector(discrete_info, selected_column, selected_value)
-    
-    return cond_vector, selected_column, selected_value
-
-#----------------------------------------------
-# 3. Neural Network Models
-#----------------------------------------------
-
-class Generator(nn.Module):
-    def __init__(self, z_dim, cond_dim, n_continuous, continuous_dims, n_discrete, discrete_dims):
-        """
-        Generator network as described in the paper.
-        
-        Parameters:
-        -----------
-        z_dim : int
-            Dimension of the noise vector
-        cond_dim : int
-            Dimension of the conditional vector
-        n_continuous : int
-            Number of continuous columns
-        continuous_dims : list
-            Number of modes for each continuous column
-        n_discrete : int
-            Number of discrete columns
-        discrete_dims : list
-            Number of categories for each discrete column
-        """
-        super(Generator, self).__init__()
-        
-        self.z_dim = z_dim
-        self.cond_dim = cond_dim
-        self.n_continuous = n_continuous
-        self.continuous_dims = continuous_dims
-        self.n_discrete = n_discrete
-        self.discrete_dims = discrete_dims
-        
-        # Calculate dimensions for output layers
-        self.continuous_outputs = []
-        for i in range(n_continuous):
-            # Each continuous column has: one value + one-hot mode vector
-            self.continuous_outputs.append(1 + continuous_dims[i])
-        
-        self.discrete_outputs = discrete_dims
-        
-        # Fully connected layers as described in the paper
-        self.fc_input = nn.Linear(z_dim + cond_dim, 256)
-        self.bn_input = nn.BatchNorm1d(256)
-        
-        self.fc_hidden1 = nn.Linear(256, 256)
-        self.bn_hidden1 = nn.BatchNorm1d(256)
-        
-        self.fc_hidden2 = nn.Linear(256, 512)
-        self.bn_hidden2 = nn.BatchNorm1d(512)
-        
-        # Output layers for continuous columns
-        self.alpha_layers = nn.ModuleList([
-            nn.Linear(512, 1) for _ in range(n_continuous)
-        ])
-        
-        self.beta_layers = nn.ModuleList([
-            nn.Linear(512, dim) for dim in continuous_dims
-        ])
-        
-        # Output layers for discrete columns
-        self.d_layers = nn.ModuleList([
-            nn.Linear(512, dim) for dim in discrete_dims
-        ])
-    
-    def forward(self, z, cond):
-        """
-        Forward pass for the generator.
-        
-        Parameters:
-        -----------
-        z : torch.Tensor
-            Noise vector
-        cond : torch.Tensor
-            Conditional vector
-            
-        Returns:
-        --------
-        dict
-            Generated data (continuous and discrete parts)
-        """
-        # Concatenate noise and condition
-        h0 = torch.cat([z, cond], dim=1)
-        
-        # Hidden layers with skip connections as described in the paper
-        h1_pre = self.fc_input(h0)
-        h1_pre = self.bn_input(h1_pre)
-        h1 = F.relu(h1_pre) + h0[:, :h1_pre.shape[1]]  # Skip connection with dimension matching
-        
-        h2_pre = self.fc_hidden1(h1)
-        h2_pre = self.bn_hidden1(h2_pre)
-        h2 = F.relu(h2_pre) + h1[:, :h2_pre.shape[1]]  # Skip connection
-        
-        h_final = self.fc_hidden2(h2)
-        h_final = self.bn_hidden2(h_final)
-        h_final = F.relu(h_final)
-        
-        # Generate continuous outputs: alpha (normalized value) and beta (mode)
-        continuous_outputs = []
-        for i in range(self.n_continuous):
-            # Alpha: tanh activation for normalized value
-            alpha = torch.tanh(self.alpha_layers[i](h_final))
-            
-            # Beta: gumbel softmax for mode selection
-            beta_logits = self.beta_layers[i](h_final)
-            beta = F.gumbel_softmax(beta_logits, tau=0.2, hard=False)
-            
-            # Concatenate alpha and beta
-            continuous_outputs.append(torch.cat([alpha, beta], dim=1))
-        
-        # Generate discrete outputs with gumbel softmax
-        discrete_outputs = []
-        for i in range(self.n_discrete):
-            d_logits = self.d_layers[i](h_final)
-            d_out = F.gumbel_softmax(d_logits, tau=0.2, hard=False)
-            discrete_outputs.append(d_out)
-        
-        return {
-            'continuous': continuous_outputs,
-            'discrete': discrete_outputs
+    def _analyze_function(self, node):
+        """Analyze a specific function node"""
+        # Create function info dictionary
+        info = {
+            'name': node.name,
+            'args': [arg.arg for arg in node.args.args],
+            'defaults': len(node.args.defaults),
+            'kwonly_args': [arg.arg for arg in node.args.kwonlyargs] if hasattr(node.args, 'kwonlyargs') else [],
+            'vararg': node.args.vararg.arg if node.args.vararg else None,
+            'kwarg': node.args.kwarg.arg if node.args.kwarg else None,
+            'docstring': ast.get_docstring(node),
+            'line_start': node.lineno,
+            'line_end': node.end_lineno if hasattr(node, 'end_lineno') else node.lineno,
+            'decorators': [d.id if isinstance(d, ast.Name) else None for d in node.decorator_list],
+            'returns': None,
+            'complexity': 0,
+            'variables': {
+                'local': set(),
+                'referenced': set(),
+                'undefined': set()
+            }
         }
-
-class Critic(nn.Module):
-    def __init__(self, input_dim, cond_dim, pac_size=10):
-        """
-        Critic network using PacGAN framework as described in the paper.
         
-        Parameters:
-        -----------
-        input_dim : int
-            Dimension of each input sample
-        cond_dim : int
-            Dimension of the conditional vector
-        pac_size : int
-            Number of samples in each pac (default: 10)
-        """
-        super(Critic, self).__init__()
+        # Extract return annotation if exists
+        if node.returns:
+            if isinstance(node.returns, ast.Name):
+                info['returns'] = node.returns.id
+            elif isinstance(node.returns, ast.Constant):
+                info['returns'] = str(node.returns.value)
         
-        self.input_dim = input_dim
-        self.cond_dim = cond_dim
-        self.pac_size = pac_size
+        # Calculate complexity (approximation of cyclomatic complexity)
+        info['complexity'] = self._calculate_complexity(node)
         
-        # Total input dimension: input_dim * pac_size + cond_dim * pac_size
-        pac_input_dim = input_dim * pac_size + cond_dim * pac_size
-        
-        # Network layers as described in the paper
-        self.fc_input = nn.Linear(pac_input_dim, 256)
-        self.fc_hidden = nn.Linear(256, 256)
-        self.fc_output = nn.Linear(256, 1)
-        
-        # Dropout layers
-        self.dropout = nn.Dropout(0.2)
-    
-    def forward(self, x_pac, cond_pac):
-        """
-        Forward pass for the critic.
-        
-        Parameters:
-        -----------
-        x_pac : torch.Tensor
-            Packed input data (batch_size, pac_size * input_dim)
-        cond_pac : torch.Tensor
-            Packed conditional vectors (batch_size, pac_size * cond_dim)
+        # Get variables information using symbol table
+        try:
+            subtree = ast.Module(body=[node], type_ignores=[])
+            table = symtable.symtable(ast.unparse(subtree), self.source_name, "exec")
+            function_table = table.get_children()[0]  # Get the function's symbol table
             
-        Returns:
-        --------
-        torch.Tensor
-            Critic output (batch_size, 1)
-        """
-        # Concatenate input and condition
-        h0 = torch.cat([x_pac, cond_pac], dim=1)
-        
-        # Hidden layers with dropout
-        h1 = F.leaky_relu(self.fc_input(h0), 0.2)
-        h1 = self.dropout(h1)
-        
-        h2 = F.leaky_relu(self.fc_hidden(h1), 0.2)
-        h2 = self.dropout(h2)
-        
-        # Output layer
-        output = self.fc_output(h2)
-        
-        return output
-
-#----------------------------------------------
-# 4. Training Functions
-#----------------------------------------------
-
-def prepare_data_for_training(data, continuous_columns, discrete_columns, n_modes=3):
-    """
-    Prepare data for CTGAN training.
-    
-    Parameters:
-    -----------
-    data : pandas.DataFrame
-        Input data
-    continuous_columns : list
-        List of continuous column names
-    discrete_columns : list
-        List of discrete column names
-    n_modes : int
-        Number of modes for GMM
-        
-    Returns:
-    --------
-    dict
-        Processed data and metadata
-    """
-    # Process continuous columns
-    continuous_info = {}
-    for col in continuous_columns:
-        gmm_params = fit_gmm(data[col], n_modes=n_modes)
-        mode_one_hot, normalized_values = transform_continuous(data[col], gmm_params)
-        
-        continuous_info[col] = {
-            'gmm_params': gmm_params,
-            'mode_one_hot': mode_one_hot,
-            'normalized_values': normalized_values,
-            'n_modes': n_modes
-        }
-    
-    # Process discrete columns
-    discrete_info = fit_discrete_encoder({col: data[col] for col in discrete_columns})
-    discrete_encoded = transform_discrete(data, discrete_info)
-    
-    # Calculate dimensions for the neural networks
-    continuous_dims = [n_modes for _ in continuous_columns]
-    discrete_dims = [discrete_info['metadata']['n_categories'][col] for col in discrete_columns]
-    
-    total_continuous_dim = sum([1 + n_modes for _ in continuous_columns])  # 1 value + n_modes one-hot vector per column
-    total_discrete_dim = sum(discrete_dims)
-    
-    input_dim = total_continuous_dim + total_discrete_dim
-    cond_dim = total_discrete_dim
-    
-    return {
-        'continuous_info': continuous_info,
-        'discrete_info': discrete_info,
-        'discrete_encoded': discrete_encoded,
-        'continuous_columns': continuous_columns,
-        'discrete_columns': discrete_columns,
-        'continuous_dims': continuous_dims,
-        'discrete_dims': discrete_dims,
-        'input_dim': input_dim,
-        'cond_dim': cond_dim,
-        'n_continuous': len(continuous_columns),
-        'n_discrete': len(discrete_columns)
-    }
-
-def create_tensors_for_critic(data, data_info, cond_vector, column, value, batch_size):
-    """
-    Create input tensors for the critic.
-    
-    Parameters:
-    -----------
-    data : pandas.DataFrame
-        Input data
-    data_info : dict
-        Data information from prepare_data_for_training
-    cond_vector : numpy.ndarray
-        Conditional vector
-    column : str
-        Conditioned column
-    value : any
-        Conditioned value
-    batch_size : int
-        Batch size
-        
-    Returns:
-    --------
-    torch.Tensor
-        Input tensor for the critic
-    """
-    # Filter data by condition
-    filtered_data = data[data[column] == value].sample(batch_size, replace=True)
-    
-    # Create inputs for continuous columns
-    continuous_parts = []
-    for col in data_info['continuous_columns']:
-        # Get mode one-hot and normalized value for this batch
-        mode_one_hot, normalized_values = transform_continuous(
-            filtered_data[col], 
-            data_info['continuous_info'][col]['gmm_params']
-        )
-        continuous_parts.append(mode_one_hot)
-        continuous_parts.append(normalized_values.reshape(-1, 1))
-    
-    # Create inputs for discrete columns
-    discrete_parts = []
-    for col in data_info['discrete_columns']:
-        # Get one-hot encoding for this batch
-        one_hot = data_info['discrete_info']['encoders'][col].transform(
-            filtered_data[col].values.reshape(-1, 1)
-        )
-        discrete_parts.append(one_hot)
-    
-    # Concatenate all parts
-    all_parts = continuous_parts + discrete_parts
-    input_tensor = np.concatenate([part for part in all_parts], axis=1)
-    
-    return torch.tensor(input_tensor, dtype=torch.float32)
-
-def pack_tensors_for_pacgan(tensors, cond_tensors, pac_size=10):
-    """
-    Pack tensors for PacGAN.
-    
-    Parameters:
-    -----------
-    tensors : torch.Tensor
-        Input tensors of shape (batch_size, input_dim)
-    cond_tensors : torch.Tensor
-        Conditional tensors of shape (batch_size, cond_dim)
-    pac_size : int
-        Number of samples in each pac
-        
-    Returns:
-    --------
-    tuple
-        (packed_tensors, packed_cond_tensors)
-    """
-    batch_size = tensors.shape[0]
-    input_dim = tensors.shape[1]
-    cond_dim = cond_tensors.shape[1]
-    
-    # Ensure batch_size is divisible by pac_size
-    usable_batch_size = (batch_size // pac_size) * pac_size
-    
-    # Reshape tensors to (batch_size//pac_size, pac_size*input_dim)
-    tensors = tensors[:usable_batch_size].view(-1, pac_size, input_dim)
-    cond_tensors = cond_tensors[:usable_batch_size].view(-1, pac_size, cond_dim)
-    
-    packed_tensors = tensors.reshape(-1, pac_size * input_dim)
-    packed_cond_tensors = cond_tensors.reshape(-1, pac_size * cond_dim)
-    
-    return packed_tensors, packed_cond_tensors
-
-def train_ctgan(data, continuous_columns, discrete_columns, n_modes=3, z_dim=64, epochs=300,
-              batch_size=128, pac_size=10, lr=2e-4, d_steps=5, g_penalty=10.0):
-    """
-    Train a CTGAN model.
-    
-    Parameters:
-    -----------
-    data : pandas.DataFrame
-        Input data
-    continuous_columns : list
-        List of continuous column names
-    discrete_columns : list
-        List of discrete column names
-    n_modes : int
-        Number of modes for GMM
-    z_dim : int
-        Dimension of the noise vector
-    epochs : int
-        Number of training epochs
-    batch_size : int
-        Batch size
-    pac_size : int
-        Number of samples in each pac for PacGAN
-    lr : float
-        Learning rate
-    d_steps : int
-        Number of discriminator steps per generator step
-    g_penalty : float
-        Gradient penalty weight for WGAN-GP
-        
-    Returns:
-    --------
-    dict
-        Trained models and data info
-    """
-    # Prepare data
-    data_info = prepare_data_for_training(data, continuous_columns, discrete_columns, n_modes)
-    
-    # Initialize models
-    generator = Generator(
-        z_dim=z_dim,
-        cond_dim=data_info['cond_dim'],
-        n_continuous=data_info['n_continuous'],
-        continuous_dims=data_info['continuous_dims'],
-        n_discrete=data_info['n_discrete'],
-        discrete_dims=data_info['discrete_dims']
-    ).to(device)
-    
-    critic = Critic(
-        input_dim=data_info['input_dim'],
-        cond_dim=data_info['cond_dim'],
-        pac_size=pac_size
-    ).to(device)
-    
-    # Initialize optimizers
-    g_optimizer = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.9))
-    c_optimizer = optim.Adam(critic.parameters(), lr=lr, betas=(0.5, 0.9))
-    
-    # Training loop
-    losses = {"critic_loss": [], "generator_loss": [], "conditional_loss": []}
-    
-    for epoch in range(epochs):
-        for _ in range(max(1, len(data) // batch_size)):
-            #---------------------------
-            # Train Critic
-            #---------------------------
-            for _ in range(d_steps):
-                c_optimizer.zero_grad()
+            for name in function_table.get_identifiers():
+                symbol = function_table.lookup(name)
                 
-                # Sample conditional vector
-                cond_vector, selected_column, selected_value = sample_conditional_vector(
-                    data, data_info['discrete_info']
-                )
-                cond_tensor = torch.tensor(cond_vector, dtype=torch.float32).to(device)
-                
-                # Create real data batch
-                real_data_tensor = create_tensors_for_critic(
-                    data, data_info, cond_vector, selected_column, selected_value, batch_size
-                ).to(device)
-                
-                # Generate fake data
-                z = torch.randn(batch_size, z_dim).to(device)
-                fake_output = generator(z, cond_tensor.repeat(batch_size, 1))
-                
-                # Prepare fake data tensor
-                fake_parts = []
-                
-                # Add continuous parts (normalized value + mode one-hot)
-                for i, col in enumerate(continuous_columns):
-                    # Get alpha (normalized value) and beta (mode one-hot)
-                    alpha = fake_output['continuous'][i][:, 0].view(-1, 1)
-                    beta = fake_output['continuous'][i][:, 1:]
+                if symbol.is_local():
+                    info['variables']['local'].add(name)
                     
-                    fake_parts.append(beta)  # Mode one-hot
-                    fake_parts.append(alpha)  # Normalized value
-                
-                # Add discrete parts
-                for i, _ in enumerate(discrete_columns):
-                    fake_parts.append(fake_output['discrete'][i])
-                
-                fake_data_tensor = torch.cat(fake_parts, dim=1).detach()  # Detach to avoid training generator
-                
-                # Pack real and fake data for PacGAN
-                # First, repeat the conditional tensor for each sample in the pac
-                real_cond_tensor = cond_tensor.repeat(batch_size, 1)
-                fake_cond_tensor = cond_tensor.repeat(batch_size, 1)
-                
-                packed_real, packed_real_cond = pack_tensors_for_pacgan(
-                    real_data_tensor, real_cond_tensor, pac_size
-                )
-                packed_fake, packed_fake_cond = pack_tensors_for_pacgan(
-                    fake_data_tensor, fake_cond_tensor, pac_size
-                )
-                
-                # Critic predictions
-                real_pred = critic(packed_real, packed_real_cond)
-                fake_pred = critic(packed_fake, packed_fake_cond)
-                
-                # WGAN loss
-                critic_loss = fake_pred.mean() - real_pred.mean()
-                
-                # Gradient penalty (WGAN-GP)
-                # Interpolate between real and fake
-                alpha = torch.rand(packed_real.size(0), 1).to(device)
-                interpolates = alpha * packed_real + (1 - alpha) * packed_fake
-                interpolates.requires_grad_(True)
-                
-                # Calculate gradients for gradient penalty
-                d_interpolates = critic(interpolates, packed_real_cond)
-                gradients = torch.autograd.grad(
-                    outputs=d_interpolates,
-                    inputs=interpolates,
-                    grad_outputs=torch.ones_like(d_interpolates).to(device),
-                    create_graph=True,
-                    retain_graph=True
-                )[0]
-                
-                gradients = gradients.view(gradients.size(0), -1)
-                gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * g_penalty
-                
-                # Final critic loss
-                critic_loss = critic_loss + gradient_penalty
-                
-                # Update critic
-                critic_loss.backward()
-                c_optimizer.step()
-                
-                losses["critic_loss"].append(critic_loss.item())
+                if symbol.is_referenced():
+                    info['variables']['referenced'].add(name)
+                    
+                    # Check if it's undefined (not parameter, not local, not imported, not global)
+                    if not (symbol.is_parameter() or 
+                            symbol.is_local() or 
+                            symbol.is_imported() or 
+                            symbol.is_global() or
+                            name in self.module_vars or
+                            name in dir(__builtins__)):
+                        info['variables']['undefined'].add(name)
+        except Exception as e:
+            info['errors'] = str(e)
             
-            #---------------------------
-            # Train Generator
-            #---------------------------
-            g_optimizer.zero_grad()
-            
-            # Sample conditional vector
-            cond_vector, selected_column, selected_value = sample_conditional_vector(
-                data, data_info['discrete_info']
-            )
-            cond_tensor = torch.tensor(cond_vector, dtype=torch.float32).to(device)
-            
-            # Generate fake data
-            z = torch.randn(batch_size, z_dim).to(device)
-            fake_output = generator(z, cond_tensor.repeat(batch_size, 1))
-            
-            # Prepare fake data tensor
-            fake_parts = []
-            
-            # Add continuous parts
-            for i, col in enumerate(continuous_columns):
-                alpha = fake_output['continuous'][i][:, 0].view(-1, 1)
-                beta = fake_output['continuous'][i][:, 1:]
+        return info
+    
+    def _calculate_complexity(self, node):
+        """Calculate approximate cyclomatic complexity"""
+        complexity = 1  # Base complexity
+        
+        # Count branching statements
+        for subnode in ast.walk(node):
+            if isinstance(subnode, (ast.If, ast.For, ast.While, ast.Try, ast.ExceptHandler)):
+                complexity += 1
+            elif isinstance(subnode, ast.BoolOp) and isinstance(subnode.op, ast.And):
+                complexity += len(subnode.values) - 1
+            elif isinstance(subnode, ast.BoolOp) and isinstance(subnode.op, ast.Or):
+                complexity += len(subnode.values) - 1
                 
-                fake_parts.append(beta)  # Mode one-hot
-                fake_parts.append(alpha)  # Normalized value
+        return complexity
+    
+    def _build_function_tree(self, node, parent=None):
+        """Build a tree representation of the function's AST"""
+        if parent is None:
+            root = Node(f"Function: {node.name}")
+            parent = root
+        
+        # Add args node
+        args_node = Node(f"Args: {', '.join([arg.arg for arg in node.args.args])}", parent=parent)
+        
+        # Walk body and create tree
+        for item in node.body:
+            if isinstance(item, ast.Assign):
+                targets = []
+                for target in item.targets:
+                    if isinstance(target, ast.Name):
+                        targets.append(target.id)
+                    elif isinstance(target, ast.Attribute):
+                        targets.append(f"{target.value.id}.{target.attr}" if hasattr(target.value, 'id') else "attr")
+                target_str = ', '.join(targets)
+                Node(f"Assign: {target_str}", parent=parent)
             
-            # Add discrete parts
-            for i, _ in enumerate(discrete_columns):
-                fake_parts.append(fake_output['discrete'][i])
+            elif isinstance(item, ast.Expr):
+                if isinstance(item.value, ast.Call):
+                    if hasattr(item.value.func, 'id'):
+                        Node(f"Call: {item.value.func.id}()", parent=parent)
+                    elif hasattr(item.value.func, 'attr'):
+                        Node(f"Call: {item.value.func.attr}()", parent=parent)
             
-            fake_data_tensor = torch.cat(fake_parts, dim=1)
-            
-            # Pack fake data for PacGAN
-            fake_cond_tensor = cond_tensor.repeat(batch_size, 1)
-            packed_fake, packed_fake_cond = pack_tensors_for_pacgan(
-                fake_data_tensor, fake_cond_tensor, pac_size
-            )
-            
-            # Calculate generator loss
-            fake_pred = critic(packed_fake, packed_fake_cond)
-            g_loss = -fake_pred.mean()  # WGAN loss
-            
-            # Conditional loss for discrete columns
-            conditional_loss = 0
-            start_idx = 0
-            
-            for i, col in enumerate(discrete_columns):
-                n_cats = data_info['discrete_dims'][i]
-                discrete_idx = data_info['discrete_columns'].index(col)
+            elif isinstance(item, ast.Return):
+                Node("Return", parent=parent)
                 
-                # Extract condition for this column from the conditional vector
-                col_cond = cond_tensor[:1, start_idx:start_idx+n_cats]  # Take just the first row
-                
-                # Get generated distribution for this column
-                col_gen = fake_output['discrete'][i]
-                
-                # If this is the selected column, compute cross-entropy
-                if col == selected_column:
-                    cross_entropy = -torch.sum(col_cond.repeat(batch_size
+            elif isinstance(item, ast.If):
+                if_node = Node("If", parent=parent)
+                for subitem in item.body:
+                    self._build_function_tree_node(subitem, if_node)
+                if item.orelse:
+                    else_node = Node("Else", parent=parent)
+                    for subitem in item.orelse:
+                        self._build_function_tree_node(subitem, else_node)
+            
+            elif isinstance(item, ast.For):
+                for_node = Node(f"For: {item.target.id if hasattr(item.target, 'id') else 'loop'}", parent=parent)
+                for subitem in item.body:
+                    self._build_function_tree_node(subitem, for_node)
+            
+            elif isinstance(item, ast.While):
+                while_node = Node("While", parent=parent)
+                for subitem in item.body:
+                    self._build_function_tree_node(subitem, while_node)
+        
+        return root
+    
+    def _build_function_tree_node(self, node, parent):
+        """Helper method to build tree nodes for function body items"""
+        if isinstance(node, ast.Assign):
+            targets = []
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    targets.append(target.id)
+            target_str = ', '.join(targets)
+            Node(f"Assign: {target_str}", parent=parent)
+        
+        elif isinstance(node, ast.Expr):
+            if isinstance(node.value, ast.Call):
+                if hasattr(node.value.func, 'id'):
+                    Node(f"Call: {node.value.func.id}()", parent=parent)
+                elif hasattr(node.value.func, 'attr'):
+                    Node(f"Call: {node.value.func.attr}()", parent=parent)
+        
+        elif isinstance(node, ast.Return):
+            Node("Return", parent=parent)
+    
+    def export_to_excel(self, output_path):
+        """Export analysis results to Excel"""
+        # Create function data for DataFrame
+        function_data = []
+        for func_name, info in self.functions.items():
+            function_data.append({
+                'Function': func_name,
+                'Arguments': ', '.join(info['args']),
+                'Line Start': info['line_start'],
+                'Line End': info['line_end'],
+                'Complexity': info['complexity'],
+                'Local Variables': ', '.join(info['variables']['local']),
+                'Undefined Variables': ', '.join(info['variables']['undefined']),
+                'Is Class Method': any(func_name in methods for _, methods in self.class_functions.items()),
+                'Docstring': textwrap.shorten(info['docstring'] or "", width=50)
+            })
+        
+        # Create Excel writer
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            # Function overview sheet
+            df_functions = pd.DataFrame(function_data)
+            df_functions.to_excel(writer, sheet_name='Functions', index=False)
+            
+            # Format the sheet
+            workbook = writer.book
+            worksheet = writer.sheets['Functions']
+            
+            # Add formats
+            header_format = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1})
+            warning_format = workbook.add_format({'bg_color': '#FFC7CE'})
+            
+            # Apply header format
+            for col_num, value in enumerate(df_functions.columns.values):
+                worksheet.write(0, col_num, value, header_format)
+            
+            # Highlight rows with undefined variables
+            for i, row in df_functions.iterrows():
+                if row['Undefined Variables']:
+                    worksheet.set_row(i + 1, None, warning_format)
+            
+            # Variable details sheet
+            var_data = []
+            for func_name, info in self.functions.items():
+                for var in info['variables']['referenced']:
+                    var_type = 'Parameter' if var in info['args'] else \
+                              'Local' if var in info['variables']['local'] else \
+                              'Undefined' if var in info['variables']['undefined'] else \
+                              'Global/Imported'
+                    var_data.append({
+                        'Function': func_name,
+                        'Variable': var,
+                        'Type': var_type
+                    })
+            
+            df_vars = pd.DataFrame(var_data)
+            df_vars.to_excel(writer, sheet_name='Variables', index=False)
+            
+            # Format variables sheet
+            var_worksheet = writer.sheets['Variables']
+            for col_num, value in enumerate(df_vars.columns.values):
+                var_worksheet.write(0, col_num, value, header_format)
+        
+        return output_path
+    
+    def visualize_function(self, function_name, output_path=None):
+        """Visualize function as a tree and optionally save to file"""
+        if function_name not in self.trees:
+            return f"Function '{function_name}' not found"
+        
+        # Print tree to console
+        tree_str = ""
+        for pre, _, node in RenderTree(self.trees[function_name]):
+            tree_str += f"{pre}{node.name}\n"
+        
+        # Export to dot file if output path provided
+        if output_path:
+            DotExporter(self.trees[function_name]).to_dotfile(output_path)
+            return f"Tree exported to {output_path}"
+        
+        return tree_str
 
-
-cross_entropy = -torch.sum(col_cond.repeat(batch_size, 1) * torch.log(col_gen + 1e-8)) / batch_size
-                    conditional_loss += cross_entropy
-                
-                start_idx += n_cats
-            
-            # Total generator loss
-            total_g_loss = g_loss + 10.0 * conditional_loss  # Apply weight to conditional loss
-            
-            # Update generator
-            total_g_loss.backward()
-            g_optimizer.step()
-            
-            losses["generator_loss"].append(g_loss.item())
-            losses["conditional_loss"].append(conditional_loss.item())
-        
-        # Print progress
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{epochs} | " +
-                  f"Critic Loss: {np.mean(losses['critic_loss'][-batch_size:]):.4f} | " +
-                  f"Generator Loss: {np.mean(losses['generator_loss'][-batch_size:]):.4f} | " +
-                  f"Conditional Loss: {np.mean(losses['conditional_loss'][-batch_size:]):.4f}")
-    
-    return {
-        'generator': generator,
-        'critic': critic,
-        'data_info': data_info,
-        'losses': losses,
-        'z_dim': z_dim
-    }
-
-#----------------------------------------------
-# 5. Sampling Functions
-#----------------------------------------------
-
-def generate_samples(model_info, n_samples=1000, condition=None):
-    """
-    Generate samples from a trained CTGAN model.
-    
-    Parameters:
-    -----------
-    model_info : dict
-        Model information from train_ctgan
-    n_samples : int
-        Number of samples to generate
-    condition : dict, optional
-        Condition to generate samples for, e.g., {'zip_code': '10001'}
-        
-    Returns:
-    --------
-    pandas.DataFrame
-        Generated samples
-    """
-    generator = model_info['generator']
-    data_info = model_info['data_info']
-    z_dim = model_info['z_dim']
-    
-    generator.eval()
-    
-    # Create batches
-    batch_size = 500
-    n_batches = (n_samples + batch_size - 1) // batch_size
-    last_batch_size = n_samples - (n_batches - 1) * batch_size
-    
-    all_continuous = {col: [] for col in data_info['continuous_columns']}
-    all_discrete = {col: [] for col in data_info['discrete_columns']}
-    
-    for i in range(n_batches):
-        current_batch_size = last_batch_size if i == n_batches - 1 else batch_size
-        
-        # Create conditional vector
-        if condition is None:
-            # Sample a random condition
-            cond_vector, _, _ = sample_conditional_vector(None, data_info['discrete_info'])
-        else:
-            # Use provided condition
-            col, val = list(condition.items())[0]
-            cond_vector = create_conditional_vector(data_info['discrete_info'], col, val)
-        
-        cond_tensor = torch.tensor(cond_vector, dtype=torch.float32).to(device)
-        
-        # Generate data
-        z = torch.randn(current_batch_size, z_dim).to(device)
-        with torch.no_grad():
-            fake_output = generator(z, cond_tensor.repeat(current_batch_size, 1))
-        
-        # Process continuous columns
-        for j, col in enumerate(data_info['continuous_columns']):
-            # Get alpha (normalized value) and beta (mode one-hot)
-            alpha = fake_output['continuous'][j][:, 0].detach().cpu().numpy()
-            beta = fake_output['continuous'][j][:, 1:].detach().cpu().numpy()
-            
-            # Convert to original scale
-            gmm_params = data_info['continuous_info'][col]['gmm_params']
-            original_values = inverse_transform_continuous(beta, alpha, gmm_params)
-            
-            all_continuous[col].extend(original_values)
-        
-        # Process discrete columns
-        for j, col in enumerate(data_info['discrete_columns']):
-            # Get one-hot encoding
-            one_hot = fake_output['discrete'][j].detach().cpu().numpy()
-            
-            # Convert one-hot to categorical
-            all_discrete[col].append(one_hot)
-    
-    # Combine all batches for discrete columns
-    for col in data_info['discrete_columns']:
-        all_discrete[col] = np.vstack(all_discrete[col])
-    
-    # Convert discrete one-hot back to categories
-    decoded_discrete = inverse_transform_discrete(all_discrete, data_info['discrete_info'])
-    
-    # Create DataFrame
-    result = {}
-    for col in data_info['continuous_columns']:
-        result[col] = all_continuous[col]
-    
-    for col in data_info['discrete_columns']:
-        result[col] = decoded_discrete[col]
-    
-    return pd.DataFrame(result)
-
-#----------------------------------------------
-# 6. Evaluation Functions
-#----------------------------------------------
-
-def evaluate_ctgan(real_data, synthetic_data, continuous_columns, discrete_columns):
-    """
-    Evaluate a CTGAN model by comparing real and synthetic data.
-    
-    Parameters:
-    -----------
-    real_data : pandas.DataFrame
-        Real data
-    synthetic_data : pandas.DataFrame
-        Synthetic data
-    continuous_columns : list
-        List of continuous column names
-    discrete_columns : list
-        List of discrete column names
-        
-    Returns:
-    --------
-    dict
-        Evaluation metrics
-    """
-    results = {}
-    
-    # Evaluate continuous columns: KL divergence
-    for col in continuous_columns:
-        real_values = real_data[col].values
-        synth_values = synthetic_data[col].values
-        
-        # Compute histograms
-        bins = min(50, max(10, int(np.sqrt(len(real_values)))))
-        hist_range = (min(real_values.min(), synth_values.min()), 
-                      max(real_values.max(), synth_values.max()))
-        
-        real_hist, bin_edges = np.histogram(real_values, bins=bins, range=hist_range, density=True)
-        synth_hist, _ = np.histogram(synth_values, bins=bin_edges, density=True)
-        
-        # Add small constant to avoid zeros
-        real_hist = real_hist + 1e-8
-        synth_hist = synth_hist + 1e-8
-        
-        # Normalize
-        real_hist = real_hist / real_hist.sum()
-        synth_hist = synth_hist / synth_hist.sum()
-        
-        # Compute KL divergence
-        kl_div = np.sum(real_hist * np.log(real_hist / synth_hist))
-        results[f"{col}_kl_divergence"] = kl_div
-    
-    # Evaluate discrete columns: Chi-squared test
-    for col in discrete_columns:
-        real_counts = real_data[col].value_counts(normalize=True).sort_index()
-        synth_counts = synthetic_data[col].value_counts(normalize=True).sort_index()
-        
-        # Align the indices
-        all_indices = sorted(list(set(real_counts.index) | set(synth_counts.index)))
-        real_counts = real_counts.reindex(all_indices).fillna(0)
-        synth_counts = synth_counts.reindex(all_indices).fillna(0)
-        
-        # Compute chi-squared
-        chi2 = np.sum((real_counts - synth_counts)**2 / (real_counts + 1e-8))
-        results[f"{col}_chi_squared"] = chi2
-        
-        # Compute distribution similarity
-        jsd = 0.5 * np.sum(real_counts * np.log((real_counts + 1e-8) / (0.5 * (real_counts + synth_counts) + 1e-8))) + \
-              0.5 * np.sum(synth_counts * np.log((synth_counts + 1e-8) / (0.5 * (real_counts + synth_counts) + 1e-8)))
-        results[f"{col}_jensen_shannon"] = jsd
-    
-    # Evaluate correlation matrix
-    real_corr = real_data.corr().values
-    synth_corr = synthetic_data.corr().values
-    corr_rmse = np.sqrt(np.mean((real_corr - synth_corr)**2))
-    results["correlation_rmse"] = corr_rmse
-    
-    return results
-
-#----------------------------------------------
-# 7. Example Usage
-#----------------------------------------------
-
-def example_usage():
-    """
-    Example of how to use the CTGAN implementation.
-    """
-    # Create or load your dataset
-    # For demonstration, create a simple dataset
-    np.random.seed(42)
-    n_samples = 5000
-    
-    # Create a continuous column with multiple modes
-    c1 = np.concatenate([
-        np.random.normal(20, 5, int(0.3 * n_samples)),
-        np.random.normal(50, 10, int(0.4 * n_samples)),
-        np.random.normal(80, 8, int(0.3 * n_samples))
-    ])
-    
-    # Create an imbalanced discrete column
-    zip_codes = np.random.choice(
-        [f"{i:05d}" for i in range(10001, 10006)],
-        size=n_samples,
-        p=[0.5, 0.25, 0.15, 0.07, 0.03]  # Imbalanced distribution
-    )
-    
-    # Create DataFrame
-    data = pd.DataFrame({
-        'transaction_amount': c1,
-        'zip_code': zip_codes
-    })
-    
-    # Define column types
-    continuous_columns = ['transaction_amount']
-    discrete_columns = ['zip_code']
-    
-    # Train CTGAN
-    print("Training CTGAN model...")
-    model_info = train_ctgan(
-        data=data,
-        continuous_columns=continuous_columns,
-        discrete_columns=discrete_columns,
-        n_modes=3,
-        z_dim=64,
-        epochs=200,
-        batch_size=128,
-        pac_size=10,
-        lr=2e-4
-    )
-    
-    # Generate synthetic samples
-    print("\nGenerating synthetic samples...")
-    synthetic_data = generate_samples(model_info, n_samples=5000)
-    
-    # Generate conditional samples
-    print("\nGenerating conditional samples...")
-    conditional_samples = {}
-    
-    for zip_code in data['zip_code'].unique():
-        print(f"  Generating samples for zip_code={zip_code}...")
-        cond_samples = generate_samples(
-            model_info,
-            n_samples=1000,
-            condition={'zip_code': zip_code}
-        )
-        conditional_samples[zip_code] = cond_samples
-    
-    # Evaluate model
-    print("\nEvaluating model...")
-    eval_results = evaluate_ctgan(data, synthetic_data, continuous_columns, discrete_columns)
-    
-    print("\nEvaluation results:")
-    for metric, value in eval_results.items():
-        print(f"  {metric}: {value:.4f}")
-    
-    # Plot distributions
-    print("\nPlotting distributions...")
-    
-    plt.figure(figsize=(12, 10))
-    
-    # Plot transaction amount distribution
-    plt.subplot(2, 2, 1)
-    plt.hist(data['transaction_amount'], bins=30, alpha=0.5, label='Real')
-    plt.hist(synthetic_data['transaction_amount'], bins=30, alpha=0.5, label='Synthetic')
-    plt.title('Transaction Amount Distribution')
-    plt.legend()
-    
-    # Plot zip code distribution
-    plt.subplot(2, 2, 2)
-    
-    real_counts = data['zip_code'].value_counts().sort_index()
-    synth_counts = synthetic_data['zip_code'].value_counts().sort_index()
-    
-    # Align indices
-    all_zip_codes = sorted(list(set(real_counts.index) | set(synth_counts.index)))
-    real_counts = real_counts.reindex(all_zip_codes).fillna(0)
-    synth_counts = synth_counts.reindex(all_zip_codes).fillna(0)
-    
-    x = np.arange(len(all_zip_codes))
-    width = 0.35
-    
-    plt.bar(x - width/2, real_counts, width, label='Real')
-    plt.bar(x + width/2, synth_counts, width, label='Synthetic')
-    plt.title('Zip Code Distribution')
-    plt.xticks(x, all_zip_codes, rotation=90)
-    plt.legend()
-    
-    # Plot conditional distributions
-    plt.subplot(2, 2, 3)
-    for i, zip_code in enumerate(sorted(conditional_samples.keys())[:3]):
-        plt.hist(
-            conditional_samples[zip_code]['transaction_amount'],
-            bins=20,
-            alpha=0.5,
-            label=f'Zip Code {zip_code}'
-        )
-    plt.title('Conditional Distribution by Zip Code')
-    plt.legend()
-    
-    # Plot correlation matrices
-    plt.subplot(2, 2, 4)
-    plt.title('Correlation Difference')
-    
-    real_corr = data.corr()
-    synth_corr = synthetic_data.corr()
-    diff_corr = real_corr - synth_corr
-    
-    plt.imshow(diff_corr, cmap='coolwarm', vmin=-1, vmax=1)
-    plt.colorbar()
-    plt.xticks(range(len(diff_corr.columns)), diff_corr.columns, rotation=90)
-    plt.yticks(range(len(diff_corr.columns)), diff_corr.columns)
-    
-    plt.tight_layout()
-    plt.savefig('ctgan_evaluation.png')
-    plt.show()
-    
-    return {
-        'real_data': data,
-        'synthetic_data': synthetic_data,
-        'conditional_samples': conditional_samples,
-        'model_info': model_info,
-        'evaluation': eval_results
-    }
-
+# Example usage
 if __name__ == "__main__":
-    results = example_usage()
+    code = """
+    def process_data(df, column_name):
+        result = df[column_name].sum()
+        if result > 0:
+            processed = result * 2
+            return processed
+        else:
+            return result * multiplier  # multiplier is undefined
+
+    def valid_function(a, b):
+        c = a + b
+        for i in range(10):
+            c += i
+        return c
+    """
+    
+    # Analyze the code
+    analyzer = FunctionAnalyzer(code_string=code)
+    functions = analyzer.analyze()
+    
+    # Print results
+    for func_name, info in functions.items():
+        print(f"Function: {func_name}")
+        print(f"Arguments: {info['args']}")
+        print(f"Complexity: {info['complexity']}")
+        print(f"Undefined variables: {info['variables']['undefined']}")
+        print(f"Tree structure:")
+        print(analyzer.visualize_function(func_name))
+        print("-" * 50)
+    
+    # Export to Excel
+    excel_path = "function_analysis.xlsx"
+    analyzer.export_to_excel(excel_path)
+    print(f"Analysis exported to {excel_path}")
