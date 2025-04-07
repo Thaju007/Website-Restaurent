@@ -1,525 +1,204 @@
 import ast
-import symtable
-from collections import defaultdict
-import pandas as pd
 import os
-import re
-import textwrap
-from anytree import Node, RenderTree
-from anytree.exporter import DotExporter
-import inspect
-import types
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+from networkx.drawing.nx_pydot import graphviz_layout
 
-class EnhancedFunctionAnalyzer:
-    def __init__(self, code_string=None, file_path=None):
-        """Initialize with either code string or file path"""
-        if file_path and os.path.exists(file_path):
-            with open(file_path, 'r') as f:
-                self.code_string = f.read()
-            self.source_name = os.path.basename(file_path)
-        elif code_string:
-            self.code_string = code_string
-            self.source_name = "<string>"
-        else:
-            raise ValueError("Either code_string or valid file_path must be provided")
-            
-        # Parse the code
-        self.parsed = ast.parse(self.code_string)
+class VariableFinder(ast.NodeVisitor):
+    def __init__(self):
         self.functions = {}
-        self.class_functions = defaultdict(list)
-        self.module_vars = {}  # Changed to dict to store type information
-        self.trees = {}
-        self.variable_types = {}
+        self.current_function = None
+        self.global_vars = set()
         
-    def analyze(self):
-        """Analyze code to find undefined variables and other metrics"""
-        # Extract module-level variables with type hints
-        for node in ast.walk(self.parsed):
-            if isinstance(node, ast.AnnAssign):
-                if isinstance(node.target, ast.Name):
-                    type_hint = self._get_type_annotation(node.annotation)
-                    self.module_vars[node.target.id] = type_hint
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        # Try to infer type from value
-                        value_type = self._infer_value_type(node.value)
-                        self.module_vars[target.id] = value_type
-        
-        # Analyze each function
-        for node in ast.walk(self.parsed):
-            if isinstance(node, ast.FunctionDef):
-                function_info = self._analyze_function(node)
-                self.functions[node.name] = function_info
-                
-                # Build function tree
-                self.trees[node.name] = self._build_function_tree(node)
-            
-            # Track class methods
-            elif isinstance(node, ast.ClassDef):
-                class_name = node.name
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef):
-                        self.class_functions[class_name].append(item.name)
-        
-        return self.functions
-    
-    def _get_type_annotation(self, annotation):
-        """Extract type annotation information"""
-        if isinstance(annotation, ast.Name):
-            return annotation.id
-        elif isinstance(annotation, ast.Subscript):
-            if isinstance(annotation.value, ast.Name):
-                if hasattr(annotation.slice, 'value'):  # Python 3.8
-                    if isinstance(annotation.slice.value, ast.Name):
-                        return f"{annotation.value.id}[{annotation.slice.value.id}]"
-                    elif isinstance(annotation.slice.value, ast.Constant):
-                        return f"{annotation.value.id}[{annotation.slice.value.value}]"
-                else:  # Python 3.9+
-                    if isinstance(annotation.slice, ast.Name):
-                        return f"{annotation.value.id}[{annotation.slice.id}]"
-                    elif isinstance(annotation.slice, ast.Constant):
-                        return f"{annotation.value.id}[{annotation.slice.value}]"
-            return "complex_type"
-        elif isinstance(annotation, ast.Attribute):
-            if isinstance(annotation.value, ast.Name):
-                return f"{annotation.value.id}.{annotation.attr}"
-        elif isinstance(annotation, ast.Constant):
-            return str(annotation.value)
-        return "unknown"
-    
-    def _infer_value_type(self, value):
-        """Try to infer variable type from its value"""
-        if isinstance(value, ast.Constant):
-            if value.value is None:
-                return "None"
-            return type(value.value).__name__
-        elif isinstance(value, ast.List):
-            return "list"
-        elif isinstance(value, ast.Dict):
-            return "dict"
-        elif isinstance(value, ast.Set):
-            return "set"
-        elif isinstance(value, ast.Tuple):
-            return "tuple"
-        elif isinstance(value, ast.Call):
-            if isinstance(value.func, ast.Name):
-                return value.func.id
-            elif isinstance(value.func, ast.Attribute):
-                if hasattr(value.func.value, 'id'):
-                    return f"{value.func.value.id}.{value.func.attr}"
-        return "unknown"
-    
-    def _analyze_function(self, node):
-        """Analyze a specific function node"""
-        # Create function info dictionary
-        info = {
-            'name': node.name,
-            'args': [],
-            'arg_types': {},
-            'defaults': len(node.args.defaults),
-            'kwonly_args': [arg.arg for arg in node.args.kwonlyargs] if hasattr(node.args, 'kwonlyargs') else [],
-            'vararg': node.args.vararg.arg if node.args.vararg else None,
-            'kwarg': node.args.kwarg.arg if node.args.kwarg else None,
-            'docstring': ast.get_docstring(node),
-            'line_start': node.lineno,
-            'line_end': node.end_lineno if hasattr(node, 'end_lineno') else node.lineno,
-            'decorators': [d.id if isinstance(d, ast.Name) else None for d in node.decorator_list],
-            'returns': None,
-            'complexity': 0,
-            'variables': {
-                'local': {},  # Changed to dict to store type information
-                'referenced': set(),
-                'undefined': set(),
-                'attributes': defaultdict(set)  # Track object attributes
-            }
+    def visit_FunctionDef(self, node):
+        prev_function = self.current_function
+        self.current_function = node.name
+        self.functions[node.name] = {
+            'local_vars': set(),
+            'global_vars': set(),
+            'params': {param.arg for param in node.args.args}
         }
         
-        # Extract argument information including type annotations
-        for arg in node.args.args:
-            info['args'].append(arg.arg)
-            if arg.annotation:
-                info['arg_types'][arg.arg] = self._get_type_annotation(arg.annotation)
+        # Visit all nodes in the function body
+        for child in node.body:
+            self.visit(child)
+            
+        self.current_function = prev_function
+        
+    def visit_Global(self, node):
+        if self.current_function:
+            self.functions[self.current_function]['global_vars'].update(node.names)
+            
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Store):
+            if self.current_function:
+                # Inside a function, might be local or global
+                if node.id not in self.functions[self.current_function]['global_vars'] and \
+                   node.id not in self.functions[self.current_function]['params']:
+                    self.functions[self.current_function]['local_vars'].add(node.id)
             else:
-                info['arg_types'][arg.arg] = "unknown"
-        
-        # Extract return annotation if exists
-        if node.returns:
-            info['returns'] = self._get_type_annotation(node.returns)
-        
-        # Calculate complexity (approximation of cyclomatic complexity)
-        info['complexity'] = self._calculate_complexity(node)
-        
-        # Analyze variable types and attributes
-        self._analyze_variable_types(node, info)
-        
-        # Get variables information using symbol table
-        try:
-            subtree = ast.Module(body=[node], type_ignores=[])
-            table = symtable.symtable(ast.unparse(subtree), self.source_name, "exec")
-            function_table = table.get_children()[0]  # Get the function's symbol table
-            
-            for name in function_table.get_identifiers():
-                symbol = function_table.lookup(name)
+                # Outside any function, must be global
+                self.global_vars.add(node.id)
                 
-                if symbol.is_local() and name not in info['variables']['local']:
-                    info['variables']['local'][name] = "unknown"
-                    
-                if symbol.is_referenced():
-                    info['variables']['referenced'].add(name)
-                    
-                    # Check if it's undefined (not parameter, not local, not imported, not global)
-                    if not (symbol.is_parameter() or 
-                            symbol.is_local() or 
-                            symbol.is_imported() or 
-                            symbol.is_global() or
-                            name in self.module_vars or
-                            name in dir(__builtins__)):
-                        info['variables']['undefined'].add(name)
-        except Exception as e:
-            info['errors'] = str(e)
-            
-        return info
+        # Continue visiting child nodes
+        self.generic_visit(node)
+
+def analyze_python_file(file_path):
+    with open(file_path, 'r') as file:
+        code = file.read()
     
-    def _analyze_variable_types(self, node, info):
-        """Analyze variable types and attribute access"""
-        for subnode in ast.walk(node):
-            # Look for type annotations in assignments
-            if isinstance(subnode, ast.AnnAssign):
-                if isinstance(subnode.target, ast.Name):
-                    var_name = subnode.target.id
-                    type_hint = self._get_type_annotation(subnode.annotation)
-                    info['variables']['local'][var_name] = type_hint
-            
-            # Look for variable assignments to infer types
-            elif isinstance(subnode, ast.Assign):
-                for target in subnode.targets:
-                    if isinstance(target, ast.Name):
-                        var_name = target.id
-                        value_type = self._infer_value_type(subnode.value)
-                        info['variables']['local'][var_name] = value_type
-            
-            # Track attribute access
-            elif isinstance(subnode, ast.Attribute):
-                if isinstance(subnode.value, ast.Name):
-                    obj_name = subnode.value.id
-                    attr_name = subnode.attr
-                    info['variables']['attributes'][obj_name].add(attr_name)
+    # Parse the code into an AST
+    tree = ast.parse(code)
     
-    def _calculate_complexity(self, node):
-        """Calculate approximate cyclomatic complexity"""
-        complexity = 1  # Base complexity
-        
-        # Count branching statements
-        for subnode in ast.walk(node):
-            if isinstance(subnode, (ast.If, ast.For, ast.While, ast.Try, ast.ExceptHandler)):
-                complexity += 1
-            elif isinstance(subnode, ast.BoolOp) and isinstance(subnode.op, ast.And):
-                complexity += len(subnode.values) - 1
-            elif isinstance(subnode, ast.BoolOp) and isinstance(subnode.op, ast.Or):
-                complexity += len(subnode.values) - 1
-                
-        return complexity
+    # Find all variables and their scopes
+    finder = VariableFinder()
+    finder.visit(tree)
     
-    def _build_function_tree(self, node, parent=None):
-        """Build a tree representation of the function's AST"""
-        if parent is None:
-            root = Node(f"Function: {node.name}")
-            parent = root
-        
-        # Add args node with type information
-        args_info = []
-        for arg in node.args.args:
-            arg_type = "unknown"
-            if arg.annotation:
-                arg_type = self._get_type_annotation(arg.annotation)
-            args_info.append(f"{arg.arg}: {arg_type}")
-        
-        args_node = Node(f"Args: {', '.join(args_info)}", parent=parent)
-        
-        # Walk body and create tree
-        for item in node.body:
-            if isinstance(item, ast.AnnAssign):
-                if isinstance(item.target, ast.Name):
-                    type_ann = self._get_type_annotation(item.annotation)
-                    Node(f"Assign: {item.target.id}: {type_ann}", parent=parent)
-            
-            elif isinstance(item, ast.Assign):
-                targets = []
-                for target in item.targets:
-                    if isinstance(target, ast.Name):
-                        value_type = self._infer_value_type(item.value)
-                        targets.append(f"{target.id}: {value_type}")
-                    elif isinstance(target, ast.Attribute):
-                        if hasattr(target.value, 'id'):
-                            targets.append(f"{target.value.id}.{target.attr}")
-                        else:
-                            targets.append("attr_assign")
-                target_str = ', '.join(targets)
-                Node(f"Assign: {target_str}", parent=parent)
-            
-            elif isinstance(item, ast.Expr):
-                if isinstance(item.value, ast.Call):
-                    func_name = "unknown"
-                    if hasattr(item.value.func, 'id'):
-                        func_name = item.value.func.id
-                    elif hasattr(item.value.func, 'attr'):
-                        obj_name = "unknown"
-                        if hasattr(item.value.func.value, 'id'):
-                            obj_name = item.value.func.value.id
-                        func_name = f"{obj_name}.{item.value.func.attr}"
-                    Node(f"Call: {func_name}()", parent=parent)
-            
-            elif isinstance(item, ast.Return):
-                return_info = "void"
-                if item.value:
-                    return_type = self._infer_value_type(item.value)
-                    return_info = return_type
-                Node(f"Return: {return_info}", parent=parent)
-                
-            elif isinstance(item, ast.If):
-                if_node = Node("If", parent=parent)
-                for subitem in item.body:
-                    self._build_function_tree_node(subitem, if_node)
-                if item.orelse:
-                    else_node = Node("Else", parent=parent)
-                    for subitem in item.orelse:
-                        self._build_function_tree_node(subitem, else_node)
-            
-            elif isinstance(item, ast.For):
-                for_node = Node(f"For: {item.target.id if hasattr(item.target, 'id') else 'loop'}", parent=parent)
-                for subitem in item.body:
-                    self._build_function_tree_node(subitem, for_node)
-            
-            elif isinstance(item, ast.While):
-                while_node = Node("While", parent=parent)
-                for subitem in item.body:
-                    self._build_function_tree_node(subitem, while_node)
-        
-        return root
+    return finder.global_vars, finder.functions
+
+def create_tree_visualization(global_vars, functions, output_file="variable_tree.png"):
+    G = nx.DiGraph()
     
-    def _build_function_tree_node(self, node, parent):
-        """Helper method to build tree nodes for function body items"""
-        if isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name):
-                type_ann = self._get_type_annotation(node.annotation)
-                Node(f"Assign: {node.target.id}: {type_ann}", parent=parent)
-                
-        elif isinstance(node, ast.Assign):
-            targets = []
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    value_type = self._infer_value_type(node.value)
-                    targets.append(f"{target.id}: {value_type}")
-                elif isinstance(target, ast.Attribute):
-                    if hasattr(target.value, 'id'):
-                        targets.append(f"{target.value.id}.{target.attr}")
-                    else:
-                        targets.append("attr_assign")
-            target_str = ', '.join(targets)
-            Node(f"Assign: {target_str}", parent=parent)
-        
-        elif isinstance(node, ast.Expr):
-            if isinstance(node.value, ast.Call):
-                func_name = "unknown"
-                if hasattr(node.value.func, 'id'):
-                    func_name = node.value.func.id
-                elif hasattr(node.value.func, 'attr'):
-                    obj_name = "unknown"
-                    if hasattr(node.value.func.value, 'id'):
-                        obj_name = node.value.func.value.id
-                    func_name = f"{obj_name}.{node.value.func.attr}"
-                Node(f"Call: {func_name}()", parent=parent)
-        
-        elif isinstance(node, ast.Return):
-            return_info = "void"
-            if node.value:
-                return_type = self._infer_value_type(node.value)
-                return_info = return_type
-            Node(f"Return: {return_info}", parent=parent)
+    # Add the root node
+    G.add_node("Python Code")
     
-    def export_to_excel(self, output_path):
-        """Export analysis results to Excel"""
-        # Create function data for DataFrame
-        function_data = []
-        for func_name, info in self.functions.items():
-            # Format arg types for display
-            arg_types = []
-            for arg in info['args']:
-                arg_type = info['arg_types'].get(arg, "unknown")
-                arg_types.append(f"{arg}: {arg_type}")
+    # Add global variables
+    if global_vars:
+        G.add_node("Global Variables")
+        G.add_edge("Python Code", "Global Variables")
+        for var in global_vars:
+            var_node = f"Global: {var}"
+            G.add_node(var_node)
+            G.add_edge("Global Variables", var_node)
+    
+    # Add functions and their variables
+    if functions:
+        G.add_node("Functions")
+        G.add_edge("Python Code", "Functions")
+        
+        for func_name, vars_dict in functions.items():
+            func_node = f"Function: {func_name}"
+            G.add_node(func_node)
+            G.add_edge("Functions", func_node)
             
-            # Format local variable types
-            local_vars = []
-            for var, var_type in info['variables']['local'].items():
-                local_vars.append(f"{var}: {var_type}")
+            # Parameters
+            if vars_dict['params']:
+                params_node = f"{func_name} Parameters"
+                G.add_node(params_node)
+                G.add_edge(func_node, params_node)
+                for param in vars_dict['params']:
+                    param_node = f"Param: {param}"
+                    G.add_node(param_node)
+                    G.add_edge(params_node, param_node)
             
-            # Format attributes
-            attributes = []
-            for obj, attrs in info['variables']['attributes'].items():
-                attributes.append(f"{obj} → {', '.join(attrs)}")
+            # Local variables
+            if vars_dict['local_vars']:
+                locals_node = f"{func_name} Local Variables"
+                G.add_node(locals_node)
+                G.add_edge(func_node, locals_node)
+                for var in vars_dict['local_vars']:
+                    var_node = f"Local: {var}"
+                    G.add_node(var_node)
+                    G.add_edge(locals_node, var_node)
             
-            function_data.append({
+            # Global variables used in this function
+            if vars_dict['global_vars']:
+                func_globals_node = f"{func_name} Global References"
+                G.add_node(func_globals_node)
+                G.add_edge(func_node, func_globals_node)
+                for var in vars_dict['global_vars']:
+                    var_node = f"Global Ref: {var}"
+                    G.add_node(var_node)
+                    G.add_edge(func_globals_node, var_node)
+    
+    # Create the visualization
+    plt.figure(figsize=(12, 8))
+    pos = graphviz_layout(G, prog="dot")
+    nx.draw(G, pos, with_labels=True, arrows=True, node_size=2000, 
+            node_color="lightblue", font_size=8, font_weight="bold")
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+    return output_file
+
+def export_to_excel(global_vars, functions, output_file="variable_analysis.xlsx"):
+    # Create dataframes for Excel
+    data = []
+    
+    # Add global variables
+    for var in global_vars:
+        data.append({
+            'Variable': var,
+            'Scope': 'Global',
+            'Function': 'N/A',
+            'Type': 'Variable'
+        })
+    
+    # Add function variables
+    for func_name, vars_dict in functions.items():
+        # Add parameters
+        for param in vars_dict['params']:
+            data.append({
+                'Variable': param,
+                'Scope': 'Parameter',
                 'Function': func_name,
-                'Arguments': ', '.join(info['args']),
-                'Argument Types': ', '.join(arg_types),
-                'Return Type': info['returns'] or "unknown",
-                'Line Start': info['line_start'],
-                'Line End': info['line_end'],
-                'Complexity': info['complexity'],
-                'Local Variables': ', '.join(local_vars),
-                'Undefined Variables': ', '.join(info['variables']['undefined']),
-                'Object Attributes': '; '.join(attributes),
-                'Is Class Method': any(func_name in methods for _, methods in self.class_functions.items()),
-                'Docstring': textwrap.shorten(info['docstring'] or "", width=50)
+                'Type': 'Parameter'
             })
         
-        # Create Excel writer
-        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-            # Function overview sheet
-            df_functions = pd.DataFrame(function_data)
-            df_functions.to_excel(writer, sheet_name='Functions', index=False)
-            
-            # Format the sheet
-            workbook = writer.book
-            worksheet = writer.sheets['Functions']
-            
-            # Add formats
-            header_format = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1})
-            warning_format = workbook.add_format({'bg_color': '#FFC7CE'})
-            
-            # Apply header format
-            for col_num, value in enumerate(df_functions.columns.values):
-                worksheet.write(0, col_num, value, header_format)
-            
-            # Highlight rows with undefined variables
-            for i, row in df_functions.iterrows():
-                if row['Undefined Variables']:
-                    worksheet.set_row(i + 1, None, warning_format)
-            
-            # Create detailed variable sheet
-            var_data = []
-            for func_name, info in self.functions.items():
-                # Add parameters
-                for arg in info['args']:
-                    var_data.append({
-                        'Function': func_name,
-                        'Variable': arg,
-                        'Type': info['arg_types'].get(arg, "unknown"),
-                        'Category': 'Parameter'
-                    })
-                
-                # Add local variables
-                for var, var_type in info['variables']['local'].items():
-                    var_data.append({
-                        'Function': func_name,
-                        'Variable': var,
-                        'Type': var_type,
-                        'Category': 'Local'
-                    })
-                
-                # Add undefined variables
-                for var in info['variables']['undefined']:
-                    var_data.append({
-                        'Function': func_name,
-                        'Variable': var,
-                        'Type': 'unknown',
-                        'Category': 'Undefined'
-                    })
-                
-                # Add attributes
-                for obj, attrs in info['variables']['attributes'].items():
-                    for attr in attrs:
-                        var_data.append({
-                            'Function': func_name,
-                            'Variable': f"{obj}.{attr}",
-                            'Type': 'unknown',
-                            'Category': 'Attribute'
-                        })
-            
-            # Add module variables to variables sheet
-            for var, var_type in self.module_vars.items():
-                var_data.append({
-                    'Function': 'Module',
-                    'Variable': var,
-                    'Type': var_type,
-                    'Category': 'Module'
-                })
-            
-            df_vars = pd.DataFrame(var_data)
-            if not df_vars.empty:
-                df_vars.to_excel(writer, sheet_name='Variables', index=False)
-                
-                # Format variables sheet
-                var_worksheet = writer.sheets['Variables']
-                for col_num, value in enumerate(df_vars.columns.values):
-                    var_worksheet.write(0, col_num, value, header_format)
+        # Add local variables
+        for var in vars_dict['local_vars']:
+            data.append({
+                'Variable': var,
+                'Scope': 'Local',
+                'Function': func_name,
+                'Type': 'Variable'
+            })
         
-        return output_path
+        # Add global references
+        for var in vars_dict['global_vars']:
+            data.append({
+                'Variable': var,
+                'Scope': 'Global',
+                'Function': func_name,
+                'Type': 'Global Reference'
+            })
     
-    def visualize_function(self, function_name, output_path=None):
-        """Visualize function as a tree and optionally save to file"""
-        if function_name not in self.trees:
-            return f"Function '{function_name}' not found"
-        
-        # Print tree to console
-        tree_str = ""
-        for pre, _, node in RenderTree(self.trees[function_name]):
-            tree_str += f"{pre}{node.name}\n"
-        
-        # Export to dot file if output path provided
-        if output_path:
-            DotExporter(self.trees[function_name]).to_dotfile(output_path)
-            if output_path.endswith('.dot'):
-                print(f"To convert to image: dot -Tpng {output_path} -o {output_path.replace('.dot', '.png')}")
-            return f"Tree exported to {output_path}"
-        
-        return tree_str
+    # Create DataFrame and export to Excel
+    df = pd.DataFrame(data)
+    df.to_excel(output_file, index=False)
+    
+    return output_file
 
-# Example usage
-if __name__ == "__main__":
-    code = """
-    def process_data(df: pd.DataFrame, column_name: str) -> float:
-        """Process the dataframe column and return a numeric result."""
-        result = df[column_name].sum()
-        if result > 0:
-            processed = result * 2
-            return processed
-        else:
-            return result * multiplier  # multiplier is undefined
-
-    class DataProcessor:
-        def __init__(self, data_source):
-            self.data = data_source
-            self.processed = False
-            
-        def process(self) -> dict:
-            results = {}
-            for col in self.data.columns:
-                results[col] = self.data[col].mean()
-            self.processed = True
-            return results
-    """
+def main():
+    # Get input from user
+    file_path = input("Enter the path to your Python file: ")
     
-    # Analyze the code
-    analyzer = EnhancedFunctionAnalyzer(code_string=code)
-    functions = analyzer.analyze()
+    if not os.path.exists(file_path):
+        print(f"Error: File '{file_path}' does not exist.")
+        return
     
-    # Print results
-    for func_name, info in functions.items():
-        print(f"Function: {func_name}")
-        print(f"Arguments: {info['args']}")
-        print(f"Argument Types: {info['arg_types']}")
-        print(f"Return Type: {info['returns'] or 'unknown'}")
-        print(f"Complexity: {info['complexity']}")
-        print(f"Local Variables: {info['variables']['local']}")
-        print(f"Undefined variables: {info['variables']['undefined']}")
-        print(f"Object Attributes: {dict(info['variables']['attributes'])}")
-        print(f"Tree structure:")
-        print(analyzer.visualize_function(func_name))
-        print("-" * 50)
+    # Analyze the file
+    global_vars, functions = analyze_python_file(file_path)
+    
+    # Create visualization
+    viz_file = create_tree_visualization(global_vars, functions)
+    print(f"Tree visualization saved as '{viz_file}'")
     
     # Export to Excel
-    excel_path = "function_analysis.xlsx"
-    analyzer.export_to_excel(excel_path)
-    print(f"Analysis exported to {excel_path}")
+    excel_file = export_to_excel(global_vars, functions)
+    print(f"Variable analysis exported to '{excel_file}'")
+    
+    # Print summary
+    print("\nAnalysis Summary:")
+    print(f"Global Variables: {len(global_vars)}")
+    print(f"Functions: {len(functions)}")
+    
+    for func_name, vars_dict in functions.items():
+        print(f"\nFunction: {func_name}")
+        print(f"  Parameters: {len(vars_dict['params'])}")
+        print(f"  Local Variables: {len(vars_dict['local_vars'])}")
+        print(f"  Global References: {len(vars_dict['global_vars'])}")
+
+if __name__ == "__main__":
+    main()
