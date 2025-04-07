@@ -1,204 +1,196 @@
 import ast
-import os
 import pandas as pd
-import matplotlib.pyplot as plt
-import networkx as nx
-from networkx.drawing.nx_pydot import graphviz_layout
 
-class VariableFinder(ast.NodeVisitor):
-    def __init__(self):
-        self.functions = {}
-        self.current_function = None
-        self.global_vars = set()
+def find_variables_in_code(code_string):
+    """
+    Parse Python code and identify variables by scope within each function.
+    
+    Args:
+        code_string (str): Python code as a string
         
-    def visit_FunctionDef(self, node):
-        prev_function = self.current_function
-        self.current_function = node.name
-        self.functions[node.name] = {
-            'local_vars': set(),
-            'global_vars': set(),
-            'params': {param.arg for param in node.args.args}
-        }
-        
-        # Visit all nodes in the function body
-        for child in node.body:
-            self.visit(child)
+    Returns:
+        tuple: (global_vars, functions_data)
+    """
+    global_vars = set()
+    functions_data = {}
+    
+    # Parse the code
+    try:
+        tree = ast.parse(code_string)
+    except SyntaxError as e:
+        return {"error": f"Syntax error in code: {str(e)}"}
+    
+    # Find global variables
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and not isinstance(node.parent, ast.FunctionDef):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    global_vars.add(target.id)
+    
+    # Process each function
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            function_name = node.name
             
-        self.current_function = prev_function
-        
-    def visit_Global(self, node):
-        if self.current_function:
-            self.functions[self.current_function]['global_vars'].update(node.names)
+            # Get parameters
+            params = [arg.arg for arg in node.args.args]
             
-    def visit_Name(self, node):
-        if isinstance(node.ctx, ast.Store):
-            if self.current_function:
-                # Inside a function, might be local or global
-                if node.id not in self.functions[self.current_function]['global_vars'] and \
-                   node.id not in self.functions[self.current_function]['params']:
-                    self.functions[self.current_function]['local_vars'].add(node.id)
-            else:
-                # Outside any function, must be global
-                self.global_vars.add(node.id)
+            # Initialize function data
+            functions_data[function_name] = {
+                'params': params,
+                'local_vars': set(),
+                'global_refs': set()
+            }
+            
+            # Find local variables and global references
+            for subnode in ast.walk(node):
+                # Find explicit global declarations
+                if isinstance(subnode, ast.Global):
+                    for name in subnode.names:
+                        functions_data[function_name]['global_refs'].add(name)
                 
-        # Continue visiting child nodes
-        self.generic_visit(node)
+                # Find variable assignments (potential local variables)
+                elif isinstance(subnode, ast.Assign):
+                    for target in subnode.targets:
+                        if isinstance(target, ast.Name):
+                            # If not a global reference and not a parameter, it's a local var
+                            if (target.id not in functions_data[function_name]['global_refs'] and 
+                                target.id not in params):
+                                functions_data[function_name]['local_vars'].add(target.id)
+    
+    return global_vars, functions_data
 
-def analyze_python_file(file_path):
-    with open(file_path, 'r') as file:
-        code = file.read()
+def export_to_excel(global_vars, functions_data, output_file='variable_analysis.xlsx'):
+    """
+    Export variable analysis to Excel
     
-    # Parse the code into an AST
-    tree = ast.parse(code)
-    
-    # Find all variables and their scopes
-    finder = VariableFinder()
-    finder.visit(tree)
-    
-    return finder.global_vars, finder.functions
-
-def create_tree_visualization(global_vars, functions, output_file="variable_tree.png"):
-    G = nx.DiGraph()
-    
-    # Add the root node
-    G.add_node("Python Code")
-    
-    # Add global variables
-    if global_vars:
-        G.add_node("Global Variables")
-        G.add_edge("Python Code", "Global Variables")
-        for var in global_vars:
-            var_node = f"Global: {var}"
-            G.add_node(var_node)
-            G.add_edge("Global Variables", var_node)
-    
-    # Add functions and their variables
-    if functions:
-        G.add_node("Functions")
-        G.add_edge("Python Code", "Functions")
+    Args:
+        global_vars (set): Global variables
+        functions_data (dict): Function data with parameters and variables
+        output_file (str): Output Excel file path
         
-        for func_name, vars_dict in functions.items():
-            func_node = f"Function: {func_name}"
-            G.add_node(func_node)
-            G.add_edge("Functions", func_node)
-            
-            # Parameters
-            if vars_dict['params']:
-                params_node = f"{func_name} Parameters"
-                G.add_node(params_node)
-                G.add_edge(func_node, params_node)
-                for param in vars_dict['params']:
-                    param_node = f"Param: {param}"
-                    G.add_node(param_node)
-                    G.add_edge(params_node, param_node)
-            
-            # Local variables
-            if vars_dict['local_vars']:
-                locals_node = f"{func_name} Local Variables"
-                G.add_node(locals_node)
-                G.add_edge(func_node, locals_node)
-                for var in vars_dict['local_vars']:
-                    var_node = f"Local: {var}"
-                    G.add_node(var_node)
-                    G.add_edge(locals_node, var_node)
-            
-            # Global variables used in this function
-            if vars_dict['global_vars']:
-                func_globals_node = f"{func_name} Global References"
-                G.add_node(func_globals_node)
-                G.add_edge(func_node, func_globals_node)
-                for var in vars_dict['global_vars']:
-                    var_node = f"Global Ref: {var}"
-                    G.add_node(var_node)
-                    G.add_edge(func_globals_node, var_node)
-    
-    # Create the visualization
-    plt.figure(figsize=(12, 8))
-    pos = graphviz_layout(G, prog="dot")
-    nx.draw(G, pos, with_labels=True, arrows=True, node_size=2000, 
-            node_color="lightblue", font_size=8, font_weight="bold")
-    plt.savefig(output_file, dpi=300, bbox_inches="tight")
-    plt.close()
-    
-    return output_file
-
-def export_to_excel(global_vars, functions, output_file="variable_analysis.xlsx"):
-    # Create dataframes for Excel
-    data = []
+    Returns:
+        str: Path to the created Excel file
+    """
+    # Prepare data for Excel
+    rows = []
     
     # Add global variables
     for var in global_vars:
-        data.append({
-            'Variable': var,
+        rows.append({
+            'Function Name': 'GLOBAL',
+            'Variable Name': var,
+            'Type': 'Variable',
             'Scope': 'Global',
-            'Function': 'N/A',
-            'Type': 'Variable'
+            'Is Parameter': 'No'
         })
     
     # Add function variables
-    for func_name, vars_dict in functions.items():
+    for func_name, data in functions_data.items():
         # Add parameters
-        for param in vars_dict['params']:
-            data.append({
-                'Variable': param,
-                'Scope': 'Parameter',
-                'Function': func_name,
-                'Type': 'Parameter'
+        for param in data['params']:
+            rows.append({
+                'Function Name': func_name,
+                'Variable Name': param,
+                'Type': 'Parameter',
+                'Scope': 'Local',
+                'Is Parameter': 'Yes'
             })
         
         # Add local variables
-        for var in vars_dict['local_vars']:
-            data.append({
-                'Variable': var,
+        for var in data['local_vars']:
+            rows.append({
+                'Function Name': func_name,
+                'Variable Name': var,
+                'Type': 'Variable',
                 'Scope': 'Local',
-                'Function': func_name,
-                'Type': 'Variable'
+                'Is Parameter': 'No'
             })
         
         # Add global references
-        for var in vars_dict['global_vars']:
-            data.append({
-                'Variable': var,
+        for var in data['global_refs']:
+            rows.append({
+                'Function Name': func_name,
+                'Variable Name': var,
+                'Type': 'Variable',
                 'Scope': 'Global',
-                'Function': func_name,
-                'Type': 'Global Reference'
+                'Is Parameter': 'No'
             })
     
     # Create DataFrame and export to Excel
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(rows)
     df.to_excel(output_file, index=False)
     
     return output_file
 
-def main():
-    # Get input from user
-    file_path = input("Enter the path to your Python file: ")
+def analyze_python_file(file_path, output_excel='variable_analysis.xlsx'):
+    """
+    Analyze a Python file and export variable information to Excel
     
-    if not os.path.exists(file_path):
-        print(f"Error: File '{file_path}' does not exist.")
-        return
+    Args:
+        file_path (str): Path to Python file
+        output_excel (str): Path to output Excel file
+        
+    Returns:
+        str: Path to the created Excel file
+    """
+    try:
+        with open(file_path, 'r') as f:
+            code = f.read()
+        
+        global_vars, functions_data = find_variables_in_code(code)
+        return export_to_excel(global_vars, functions_data, output_excel)
     
-    # Analyze the file
-    global_vars, functions = analyze_python_file(file_path)
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return None
+
+def analyze_python_code(code_string, output_excel='variable_analysis.xlsx'):
+    """
+    Analyze Python code string and export variable information to Excel
     
-    # Create visualization
-    viz_file = create_tree_visualization(global_vars, functions)
-    print(f"Tree visualization saved as '{viz_file}'")
+    Args:
+        code_string (str): Python code as a string
+        output_excel (str): Path to output Excel file
+        
+    Returns:
+        str: Path to the created Excel file
+    """
+    try:
+        global_vars, functions_data = find_variables_in_code(code_string)
+        return export_to_excel(global_vars, functions_data, output_excel)
     
-    # Export to Excel
-    excel_file = export_to_excel(global_vars, functions)
-    print(f"Variable analysis exported to '{excel_file}'")
-    
-    # Print summary
-    print("\nAnalysis Summary:")
-    print(f"Global Variables: {len(global_vars)}")
-    print(f"Functions: {len(functions)}")
-    
-    for func_name, vars_dict in functions.items():
-        print(f"\nFunction: {func_name}")
-        print(f"  Parameters: {len(vars_dict['params'])}")
-        print(f"  Local Variables: {len(vars_dict['local_vars'])}")
-        print(f"  Global References: {len(vars_dict['global_vars'])}")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return None
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    if len(sys.argv) > 1:
+        # If file path is provided as command line argument
+        file_path = sys.argv[1]
+        output = analyze_python_file(file_path)
+        if output:
+            print(f"Analysis completed. Results saved to {output}")
+    else:
+        # Otherwise prompt for input
+        print("How would you like to provide the Python code?")
+        print("1. Enter a file path")
+        print("2. Paste code directly")
+        
+        choice = input("Enter your choice (1 or 2): ")
+        
+        if choice == '1':
+            file_path = input("Enter the path to your Python file: ")
+            output = analyze_python_file(file_path)
+            if output:
+                print(f"Analysis completed. Results saved to {output}")
+        elif choice == '2':
+            print("Paste your Python code below (press Ctrl+D or Ctrl+Z when finished):")
+            code = sys.stdin.read()
+            output = analyze_python_code(code)
+            if output:
+                print(f"Analysis completed. Results saved to {output}")
+        else:
+            print("Invalid choice.")
