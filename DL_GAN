@@ -1,196 +1,537 @@
-import ast
+"""
+Enterprise-ready CTGAN implementation using functional programming approach
+Based on the CTGAN paper with PyTorch implementation
+"""
+
+import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
+from sklearn.preprocessing import OneHotEncoder
 
-def find_variables_in_code(code_string):
-    """
-    Parse Python code and identify variables by scope within each function.
+# Constants
+BATCH_SIZE = 500
+CRITIC_ITERS = 5
+LAMBDA_GP = 10
+LAMBDA_COND = 1.0
+Z_DIM = 128
+HIDDEN_DIM = 256
+LEARNING_RATE = 2e-4
+EPOCHS = 300
+
+# --------- Preprocessing Functions ---------
+
+def fit_gaussian_mixture_models(data, continuous_columns):
+    """Fit Gaussian Mixture Models to continuous columns for mode-specific normalization"""
+    gmms = {}
+    n_components = {}
     
-    Args:
-        code_string (str): Python code as a string
+    for column in continuous_columns:
+        # Step 1: Use VGM to estimate number of modes
+        vgm = BayesianGaussianMixture(
+            n_components=10,  # Start with a high number and let VGM prune
+            weight_concentration_prior_type="dirichlet_process",
+            weight_concentration_prior=0.001,
+            n_init=5,
+            random_state=42
+        )
+        vgm.fit(data[column].values.reshape(-1, 1))
         
-    Returns:
-        tuple: (global_vars, functions_data)
+        # Count effective components (those with non-negligible weights)
+        effective_components = np.sum(vgm.weights_ > 0.01)
+        effective_components = max(1, effective_components)  # At least 1 component
+        n_components[column] = effective_components
+        
+        # Step 2: Fit a regular GMM with the estimated number of components
+        gmm = GaussianMixture(
+            n_components=effective_components,
+            n_init=5,
+            random_state=42
+        )
+        gmm.fit(data[column].values.reshape(-1, 1))
+        gmms[column] = gmm
+    
+    return gmms, n_components
+
+def normalize_continuous_columns(data, continuous_columns, gmms):
     """
-    global_vars = set()
-    functions_data = {}
+    Apply mode-specific normalization to continuous columns
+    Returns normalized data and mode indicators
+    """
+    normalized_data = data.copy()
+    mode_indicators = {}
     
-    # Parse the code
+    for column in continuous_columns:
+        gmm = gmms[column]
+        values = data[column].values.reshape(-1, 1)
+        
+        # Step 3: Compute probability densities for each mode
+        probs = gmm.predict_proba(values)
+        
+        # Step 4: Sample modes based on these probabilities
+        modes = np.zeros_like(probs)
+        selected_modes = np.argmax(probs, axis=1)
+        modes[np.arange(len(selected_modes)), selected_modes] = 1
+        
+        # Normalize within the selected mode
+        means = gmm.means_.reshape(-1)
+        stds = np.sqrt(gmm.covariances_).reshape(-1)
+        
+        normalized_values = np.zeros(len(values))
+        for mode_idx in range(gmm.n_components):
+            mode_filter = (selected_modes == mode_idx)
+            if np.any(mode_filter):
+                normalized_values[mode_filter] = ((values[mode_filter].reshape(-1) - means[mode_idx]) / 
+                                                 (4 * stds[mode_idx]))
+        
+        normalized_data[column] = normalized_values
+        mode_indicators[column] = modes
+    
+    return normalized_data, mode_indicators
+
+def fit_categorical_encoders(data, categorical_columns):
+    """Fit one-hot encoders for categorical columns"""
+    encoders = {}
+    encoded_dims = {}
+    
+    for column in categorical_columns:
+        encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+        encoder.fit(data[column].values.reshape(-1, 1))
+        encoders[column] = encoder
+        encoded_dims[column] = len(encoder.categories_[0])
+    
+    return encoders, encoded_dims
+
+def transform_data(data, continuous_columns, categorical_columns, gmms, encoders):
+    """Transform data for model input"""
+    # Normalize continuous columns
+    normalized_data, mode_indicators = normalize_continuous_columns(data, continuous_columns, gmms)
+    
+    # Transform categorical columns using one-hot encoding
+    transformed_data = []
+    
+    # First, add normalized continuous data
+    for column in continuous_columns:
+        transformed_data.append(normalized_data[column].values.reshape(-1, 1))
+    
+    # Next, add mode indicators for continuous data
+    for column in continuous_columns:
+        transformed_data.append(mode_indicators[column])
+    
+    # Finally, add one-hot encoded categorical data
+    for column in categorical_columns:
+        encoder = encoders[column]
+        encoded = encoder.transform(data[column].values.reshape(-1, 1))
+        transformed_data.append(encoded)
+    
+    # Concatenate all components
+    return np.hstack(transformed_data)
+
+def inverse_transform(generated_data, continuous_columns, categorical_columns, gmms, encoders, n_continuous):
+    """Convert generated data back to original format"""
+    data_dict = {}
+    
+    # Process continuous columns
+    current_idx = 0
+    cont_normalized_data = {}
+    mode_indicators = {}
+    
+    # Extract normalized values
+    for i, column in enumerate(continuous_columns):
+        cont_normalized_data[column] = generated_data[:, current_idx].numpy()
+        current_idx += 1
+    
+    # Extract mode indicators
+    for i, column in enumerate(continuous_columns):
+        gmm = gmms[column]
+        n_modes = gmm.n_components
+        mode_indicators[column] = generated_data[:, current_idx:current_idx + n_modes].numpy()
+        current_idx += n_modes
+    
+    # Denormalize continuous data
+    for column in continuous_columns:
+        gmm = gmms[column]
+        normalized_values = cont_normalized_data[column]
+        modes = np.argmax(mode_indicators[column], axis=1)
+        
+        means = gmm.means_.reshape(-1)
+        stds = np.sqrt(gmm.covariances_).reshape(-1)
+        
+        denormalized = np.zeros_like(normalized_values)
+        for mode_idx in range(gmm.n_components):
+            mode_filter = (modes == mode_idx)
+            if np.any(mode_filter):
+                denormalized[mode_filter] = (normalized_values[mode_filter] * 4 * stds[mode_idx]) + means[mode_idx]
+        
+        data_dict[column] = denormalized
+    
+    # Process categorical columns
+    for column in categorical_columns:
+        encoder = encoders[column]
+        n_categories = len(encoder.categories_[0])
+        
+        # Extract one-hot encoded data for this column
+        encoded_data = generated_data[:, current_idx:current_idx + n_categories].numpy()
+        current_idx += n_categories
+        
+        # Convert from one-hot back to categorical
+        categorical_data = np.argmax(encoded_data, axis=1)
+        
+        # Map from numeric indices back to original categories
+        original_categories = encoder.categories_[0]
+        data_dict[column] = np.array([original_categories[idx] for idx in categorical_data])
+    
+    return pd.DataFrame(data_dict)
+
+# --------- GAN Model Functions ---------
+
+def gumbel_softmax(logits, temperature=0.2):
+    """Gumbel-Softmax activation function"""
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+    y = logits + gumbel_noise
+    return F.softmax(y / temperature, dim=-1)
+
+def generator_network(z, cond, continuous_dims, mode_sizes, categorical_dims):
+    """
+    Generator network as described in the paper
+    z: random noise
+    cond: conditional vector for controlling discrete outputs
+    """
+    # Combine noise and condition
+    h0 = torch.cat([z, cond], dim=1)
+    input_dim = z.size(1) + cond.size(1)
+    
+    # First hidden layer with skip connection
+    fc1 = nn.Linear(input_dim, HIDDEN_DIM)
+    bn1 = nn.BatchNorm1d(HIDDEN_DIM)
+    h1 = torch.cat([h0, F.relu(bn1(fc1(h0)))], dim=1)
+    
+    # Second hidden layer with skip connection
+    fc2 = nn.Linear(input_dim + HIDDEN_DIM, HIDDEN_DIM)
+    bn2 = nn.BatchNorm1d(HIDDEN_DIM)
+    h2 = torch.cat([h1, F.relu(bn2(fc2(h1)))], dim=1)
+    
+    last_dim = input_dim + HIDDEN_DIM * 2
+    
+    # Output layers
+    output_parts = []
+    
+    # Generate continuous normalized values using tanh
+    for i in range(continuous_dims):
+        fc_alpha = nn.Linear(last_dim, 1)
+        alpha = torch.tanh(fc_alpha(h2))
+        output_parts.append(alpha)
+    
+    # Generate mode indicators using gumbel softmax
+    for size in mode_sizes:
+        fc_beta = nn.Linear(last_dim, size)
+        beta = gumbel_softmax(fc_beta(h2), temperature=0.2)
+        output_parts.append(beta)
+    
+    # Generate discrete values using gumbel softmax
+    for size in categorical_dims:
+        fc_d = nn.Linear(last_dim, size)
+        d = gumbel_softmax(fc_d(h2), temperature=0.2)
+        output_parts.append(d)
+    
+    # Concatenate all outputs
+    return torch.cat(output_parts, dim=1)
+
+def critic_network(x, cond, pac_size=10):
+    """
+    Critic network as described in the paper
+    Implements PacGAN with given pac_size
+    """
+    # Reshape inputs for pac
+    batch_size = x.size(0) // pac_size
+    x = x.view(batch_size, pac_size * x.size(1))
+    cond = cond.view(batch_size, pac_size * cond.size(1))
+    
+    # Combine inputs and condition
+    h0 = torch.cat([x, cond], dim=1)
+    
+    # First hidden layer with dropout and leaky ReLU
+    fc1 = nn.Linear(h0.size(1), HIDDEN_DIM)
+    h1 = F.leaky_relu(fc1(h0), 0.2)
+    h1 = F.dropout(h1, 0.5, training=True)
+    
+    # Second hidden layer with dropout and leaky ReLU
+    fc2 = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
+    h2 = F.leaky_relu(fc2(h1), 0.2)
+    h2 = F.dropout(h2, 0.5, training=True)
+    
+    # Output layer
+    fc3 = nn.Linear(HIDDEN_DIM, 1)
+    return fc3(h2)
+
+def compute_gradient_penalty(critic, real_data, fake_data, cond, device):
+    """Calculate gradient penalty for WGAN-GP"""
+    batch_size = real_data.size(0)
+    alpha = torch.rand(batch_size, 1, device=device)
+    
+    # Interpolate between real and fake data
+    interpolates = alpha * real_data + (1 - alpha) * fake_data
+    interpolates.requires_grad_(True)
+    
+    # Calculate critic output for interpolated data
+    disc_interpolates = critic_network(interpolates, cond)
+    
+    # Calculate gradients
+    gradients = torch.autograd.grad(
+        outputs=disc_interpolates, 
+        inputs=interpolates,
+        grad_outputs=torch.ones_like(disc_interpolates),
+        create_graph=True, 
+        retain_graph=True
+    )[0]
+    
+    # Calculate gradient penalty
+    gradients = gradients.view(batch_size, -1)
+    gradient_norm = gradients.norm(2, dim=1)
+    gradient_penalty = ((gradient_norm - 1) ** 2).mean()
+    
+    return gradient_penalty
+
+def sample_training_data(data_loader, categorical_dims, device):
+    """Sample training data with training-by-sampling method"""
+    # Get a batch of real data
     try:
-        tree = ast.parse(code_string)
-    except SyntaxError as e:
-        return {"error": f"Syntax error in code: {str(e)}"}
+        real_data, real_cond = next(data_loader_iter)
+    except:
+        data_loader_iter = iter(data_loader)
+        real_data, real_cond = next(data_loader_iter)
     
-    # Find global variables
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and not isinstance(node.parent, ast.FunctionDef):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    global_vars.add(target.id)
+    real_data = real_data.to(device)
+    real_cond = real_cond.to(device)
     
-    # Process each function
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            function_name = node.name
+    # Create conditional vector for generator
+    batch_size = real_data.size(0)
+    cond = torch.zeros_like(real_cond)
+    
+    # For each sample, randomly select one discrete column
+    for i in range(batch_size):
+        # Randomly select a categorical column
+        if len(categorical_dims) > 0:
+            selected_col = np.random.randint(len(categorical_dims))
             
-            # Get parameters
-            params = [arg.arg for arg in node.args.args]
+            # Create probability distribution based on log(frequency)
+            # For simplicity, we use uniform sampling here
+            # In a full implementation, you'd use the actual frequencies
+            col_start = sum(categorical_dims[:selected_col])
+            col_size = categorical_dims[selected_col]
+            col_val = np.random.randint(col_size)
             
-            # Initialize function data
-            functions_data[function_name] = {
-                'params': params,
-                'local_vars': set(),
-                'global_refs': set()
-            }
-            
-            # Find local variables and global references
-            for subnode in ast.walk(node):
-                # Find explicit global declarations
-                if isinstance(subnode, ast.Global):
-                    for name in subnode.names:
-                        functions_data[function_name]['global_refs'].add(name)
+            # Set the corresponding element to 1
+            cond[i, col_start + col_val] = 1
+    
+    return real_data, real_cond, cond
+
+def create_noise(batch_size, z_dim, device):
+    """Create random noise for generator input"""
+    return torch.randn(batch_size, z_dim, device=device)
+
+def train_ctgan(data, continuous_columns, categorical_columns, device='cuda'):
+    """Train the CTGAN model"""
+    # Preprocess data
+    gmms, n_components = fit_gaussian_mixture_models(data, continuous_columns)
+    encoders, encoded_dims = fit_categorical_encoders(data, categorical_columns)
+    
+    transformed_data = transform_data(data, continuous_columns, categorical_columns, gmms, encoders)
+    
+    # Prepare dimensions information
+    continuous_dims = len(continuous_columns)
+    mode_sizes = [n_components[col] for col in continuous_columns]
+    categorical_dims = [encoded_dims[col] for col in categorical_columns]
+    
+    # Calculate conditional vector size (sum of all categorical dimensions)
+    cond_dim = sum(categorical_dims)
+    
+    # Create dataset and dataloader
+    tensor_x = torch.Tensor(transformed_data)
+    
+    # Create conditional vectors (one-hot encoding of categorical columns)
+    cond_data = np.zeros((len(tensor_x), cond_dim))
+    current_pos = 0
+    for i, col in enumerate(categorical_columns):
+        col_data = transformed_data[:, -sum(categorical_dims) + current_pos:
+                                    -sum(categorical_dims) + current_pos + categorical_dims[i]]
+        cond_data[:, current_pos:current_pos + categorical_dims[i]] = col_data
+        current_pos += categorical_dims[i]
+    
+    tensor_cond = torch.Tensor(cond_data)
+    dataset = TensorDataset(tensor_x, tensor_cond)
+    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    
+    # Create optimizers
+    generator_params = []
+    critic_params = []
+    
+    # Since we're using functional approach, we need to create all parameters
+    # Generator parameters
+    generator_params.append(nn.Linear(Z_DIM + cond_dim, HIDDEN_DIM).to(device))
+    generator_params.append(nn.BatchNorm1d(HIDDEN_DIM).to(device))
+    generator_params.append(nn.Linear(Z_DIM + cond_dim + HIDDEN_DIM, HIDDEN_DIM).to(device))
+    generator_params.append(nn.BatchNorm1d(HIDDEN_DIM).to(device))
+    
+    last_dim = Z_DIM + cond_dim + HIDDEN_DIM * 2
+    
+    # Output layers for generator
+    for _ in range(continuous_dims):
+        generator_params.append(nn.Linear(last_dim, 1).to(device))
+    
+    for size in mode_sizes:
+        generator_params.append(nn.Linear(last_dim, size).to(device))
+    
+    for size in categorical_dims:
+        generator_params.append(nn.Linear(last_dim, size).to(device))
+    
+    # Critic parameters
+    input_dim = tensor_x.size(1)
+    critic_params.append(nn.Linear(10 * input_dim + 10 * cond_dim, HIDDEN_DIM).to(device))
+    critic_params.append(nn.Linear(HIDDEN_DIM, HIDDEN_DIM).to(device))
+    critic_params.append(nn.Linear(HIDDEN_DIM, 1).to(device))
+    
+    # Create optimizers
+    optimizer_g = optim.Adam([p for p in generator_params if p.requires_grad], lr=LEARNING_RATE, betas=(0.5, 0.9))
+    optimizer_c = optim.Adam([p for p in critic_params if p.requires_grad], lr=LEARNING_RATE, betas=(0.5, 0.9))
+    
+    # Training loop
+    for epoch in range(EPOCHS):
+        for i in range(len(data_loader)):
+            # Train critic
+            for _ in range(CRITIC_ITERS):
+                # Sample real data
+                real_data, real_cond, cond = sample_training_data(data_loader, categorical_dims, device)
                 
-                # Find variable assignments (potential local variables)
-                elif isinstance(subnode, ast.Assign):
-                    for target in subnode.targets:
-                        if isinstance(target, ast.Name):
-                            # If not a global reference and not a parameter, it's a local var
-                            if (target.id not in functions_data[function_name]['global_refs'] and 
-                                target.id not in params):
-                                functions_data[function_name]['local_vars'].add(target.id)
+                # Generate fake data
+                z = create_noise(BATCH_SIZE, Z_DIM, device)
+                fake_data = generator_network(z, cond, continuous_dims, mode_sizes, categorical_dims)
+                
+                # Calculate critic loss
+                real_critic = critic_network(real_data, real_cond)
+                fake_critic = critic_network(fake_data.detach(), cond)
+                
+                # Gradient penalty
+                gp = compute_gradient_penalty(critic_network, real_data, fake_data.detach(), cond, device)
+                
+                # Wasserstein loss
+                critic_loss = torch.mean(fake_critic) - torch.mean(real_critic) + LAMBDA_GP * gp
+                
+                # Update critic
+                optimizer_c.zero_grad()
+                critic_loss.backward()
+                optimizer_c.step()
+            
+            # Train generator
+            # Sample conditions and generate fake data
+            _, _, cond = sample_training_data(data_loader, categorical_dims, device)
+            z = create_noise(BATCH_SIZE, Z_DIM, device)
+            fake_data = generator_network(z, cond, continuous_dims, mode_sizes, categorical_dims)
+            
+            # Calculate generator loss
+            fake_critic = critic_network(fake_data, cond)
+            generator_loss = -torch.mean(fake_critic)
+            
+            # Add conditional loss if categorical columns exist
+            if cond_dim > 0:
+                # Extract the generated categorical part
+                cat_start_idx = continuous_dims + sum(mode_sizes)
+                cat_fake_data = fake_data[:, cat_start_idx:]
+                
+                # Calculate cross-entropy loss for each categorical column
+                cond_loss = 0
+                current_pos = 0
+                for i, dim in enumerate(categorical_dims):
+                    target = cond[:, current_pos:current_pos + dim]
+                    pred = cat_fake_data[:, current_pos:current_pos + dim]
+                    
+                    # Cross entropy between target and prediction
+                    cond_loss += F.binary_cross_entropy(pred, target)
+                    current_pos += dim
+                
+                generator_loss += LAMBDA_COND * cond_loss
+            
+            # Update generator
+            optimizer_g.zero_grad()
+            generator_loss.backward()
+            optimizer_g.step()
+        
+        # Print progress
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{EPOCHS}, G Loss: {generator_loss.item():.4f}, C Loss: {critic_loss.item():.4f}")
     
-    return global_vars, functions_data
+    # Create a model dictionary to return
+    model = {
+        'gmms': gmms,
+        'n_components': n_components,
+        'encoders': encoders,
+        'encoded_dims': encoded_dims,
+        'continuous_columns': continuous_columns,
+        'categorical_columns': categorical_columns,
+        'continuous_dims': continuous_dims,
+        'mode_sizes': mode_sizes,
+        'categorical_dims': categorical_dims,
+        'cond_dim': cond_dim,
+        'generator_params': generator_params,
+        'z_dim': Z_DIM,
+        'device': device
+    }
+    
+    return model
 
-def export_to_excel(global_vars, functions_data, output_file='variable_analysis.xlsx'):
-    """
-    Export variable analysis to Excel
+def generate_samples(model, n_samples):
+    """Generate synthetic samples using the trained model"""
+    # Unpack model components
+    gmms = model['gmms']
+    encoders = model['encoders']
+    continuous_columns = model['continuous_columns']
+    categorical_columns = model['categorical_columns']
+    continuous_dims = model['continuous_dims']
+    mode_sizes = model['mode_sizes']
+    categorical_dims = model['categorical_dims']
+    cond_dim = model['cond_dim']
+    generator_params = model['generator_params']
+    z_dim = model['z_dim']
+    device = model['device']
     
-    Args:
-        global_vars (set): Global variables
-        functions_data (dict): Function data with parameters and variables
-        output_file (str): Output Excel file path
-        
-    Returns:
-        str: Path to the created Excel file
-    """
-    # Prepare data for Excel
-    rows = []
+    # Create random noise
+    z = create_noise(n_samples, z_dim, device)
     
-    # Add global variables
-    for var in global_vars:
-        rows.append({
-            'Function Name': 'GLOBAL',
-            'Variable Name': var,
-            'Type': 'Variable',
-            'Scope': 'Global',
-            'Is Parameter': 'No'
-        })
+    # Create random conditions (for enterprise use, you may want to control this)
+    cond = torch.zeros(n_samples, cond_dim, device=device)
+    for i in range(n_samples):
+        for j, dim in enumerate(categorical_dims):
+            col_start = sum(categorical_dims[:j])
+            col_val = np.random.randint(dim)
+            cond[i, col_start + col_val] = 1
     
-    # Add function variables
-    for func_name, data in functions_data.items():
-        # Add parameters
-        for param in data['params']:
-            rows.append({
-                'Function Name': func_name,
-                'Variable Name': param,
-                'Type': 'Parameter',
-                'Scope': 'Local',
-                'Is Parameter': 'Yes'
-            })
-        
-        # Add local variables
-        for var in data['local_vars']:
-            rows.append({
-                'Function Name': func_name,
-                'Variable Name': var,
-                'Type': 'Variable',
-                'Scope': 'Local',
-                'Is Parameter': 'No'
-            })
-        
-        # Add global references
-        for var in data['global_refs']:
-            rows.append({
-                'Function Name': func_name,
-                'Variable Name': var,
-                'Type': 'Variable',
-                'Scope': 'Global',
-                'Is Parameter': 'No'
-            })
+    # Generate data
+    with torch.no_grad():
+        fake_data = generator_network(z, cond, continuous_dims, mode_sizes, categorical_dims)
     
-    # Create DataFrame and export to Excel
-    df = pd.DataFrame(rows)
-    df.to_excel(output_file, index=False)
-    
-    return output_file
+    # Convert to original format
+    return inverse_transform(fake_data, continuous_columns, categorical_columns, 
+                           gmms, encoders, continuous_dims)
 
-def analyze_python_file(file_path, output_excel='variable_analysis.xlsx'):
-    """
-    Analyze a Python file and export variable information to Excel
-    
-    Args:
-        file_path (str): Path to Python file
-        output_excel (str): Path to output Excel file
-        
-    Returns:
-        str: Path to the created Excel file
-    """
-    try:
-        with open(file_path, 'r') as f:
-            code = f.read()
-        
-        global_vars, functions_data = find_variables_in_code(code)
-        return export_to_excel(global_vars, functions_data, output_excel)
-    
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return None
-
-def analyze_python_code(code_string, output_excel='variable_analysis.xlsx'):
-    """
-    Analyze Python code string and export variable information to Excel
-    
-    Args:
-        code_string (str): Python code as a string
-        output_excel (str): Path to output Excel file
-        
-    Returns:
-        str: Path to the created Excel file
-    """
-    try:
-        global_vars, functions_data = find_variables_in_code(code_string)
-        return export_to_excel(global_vars, functions_data, output_excel)
-    
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return None
-
+# Example usage
 if __name__ == "__main__":
-    import sys
+    # Load your data
+    data = pd.read_csv("your_data.csv")
     
-    if len(sys.argv) > 1:
-        # If file path is provided as command line argument
-        file_path = sys.argv[1]
-        output = analyze_python_file(file_path)
-        if output:
-            print(f"Analysis completed. Results saved to {output}")
-    else:
-        # Otherwise prompt for input
-        print("How would you like to provide the Python code?")
-        print("1. Enter a file path")
-        print("2. Paste code directly")
-        
-        choice = input("Enter your choice (1 or 2): ")
-        
-        if choice == '1':
-            file_path = input("Enter the path to your Python file: ")
-            output = analyze_python_file(file_path)
-            if output:
-                print(f"Analysis completed. Results saved to {output}")
-        elif choice == '2':
-            print("Paste your Python code below (press Ctrl+D or Ctrl+Z when finished):")
-            code = sys.stdin.read()
-            output = analyze_python_code(code)
-            if output:
-                print(f"Analysis completed. Results saved to {output}")
-        else:
-            print("Invalid choice.")
+    # Define continuous and categorical columns
+    continuous_columns = ["age", "income", "height", "weight"]
+    categorical_columns = ["gender", "education", "occupation"]
+    
+    # Train model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = train_ctgan(data, continuous_columns, categorical_columns, device)
+    
+    # Generate synthetic data
+    synthetic_data = generate_samples(model, 1000)
+    
+    # Save synthetic data
+    synthetic_data.to_csv("synthetic_data.csv", index=False)
