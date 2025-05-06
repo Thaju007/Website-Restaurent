@@ -365,75 +365,228 @@ def train_ctgan(data, continuous_columns, categorical_columns, device='cuda'):
     tensor_cond = torch.Tensor(cond_data)
     dataset = TensorDataset(tensor_x, tensor_cond)
     data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    data_loader_iter = iter(data_loader)
     
-    # Create optimizers
-    generator_params = []
-    critic_params = []
+    # Store optimizers and modules in dicts to ensure proper tracking
+    gen_modules = {}
+    critic_modules = {}
     
-    # Since we're using functional approach, we need to create all parameters
-    # Generator parameters
-    generator_params.append(nn.Linear(Z_DIM + cond_dim, HIDDEN_DIM).to(device))
-    generator_params.append(nn.BatchNorm1d(HIDDEN_DIM).to(device))
-    generator_params.append(nn.Linear(Z_DIM + cond_dim + HIDDEN_DIM, HIDDEN_DIM).to(device))
-    generator_params.append(nn.BatchNorm1d(HIDDEN_DIM).to(device))
+    # Generator modules
+    gen_modules['fc1'] = nn.Linear(Z_DIM + cond_dim, HIDDEN_DIM).to(device)
+    gen_modules['bn1'] = nn.BatchNorm1d(HIDDEN_DIM).to(device)
+    gen_modules['fc2'] = nn.Linear(Z_DIM + cond_dim + HIDDEN_DIM, HIDDEN_DIM).to(device)
+    gen_modules['bn2'] = nn.BatchNorm1d(HIDDEN_DIM).to(device)
     
     last_dim = Z_DIM + cond_dim + HIDDEN_DIM * 2
     
     # Output layers for generator
-    for _ in range(continuous_dims):
-        generator_params.append(nn.Linear(last_dim, 1).to(device))
+    for i in range(continuous_dims):
+        gen_modules[f'fc_alpha_{i}'] = nn.Linear(last_dim, 1).to(device)
     
-    for size in mode_sizes:
-        generator_params.append(nn.Linear(last_dim, size).to(device))
+    for i, size in enumerate(mode_sizes):
+        gen_modules[f'fc_beta_{i}'] = nn.Linear(last_dim, size).to(device)
     
-    for size in categorical_dims:
-        generator_params.append(nn.Linear(last_dim, size).to(device))
+    for i, size in enumerate(categorical_dims):
+        gen_modules[f'fc_d_{i}'] = nn.Linear(last_dim, size).to(device)
     
-    # Critic parameters
+    # Critic modules
     input_dim = tensor_x.size(1)
-    critic_params.append(nn.Linear(10 * input_dim + 10 * cond_dim, HIDDEN_DIM).to(device))
-    critic_params.append(nn.Linear(HIDDEN_DIM, HIDDEN_DIM).to(device))
-    critic_params.append(nn.Linear(HIDDEN_DIM, 1).to(device))
+    critic_modules['fc1'] = nn.Linear(10 * input_dim + 10 * cond_dim, HIDDEN_DIM).to(device)
+    critic_modules['fc2'] = nn.Linear(HIDDEN_DIM, HIDDEN_DIM).to(device)
+    critic_modules['fc3'] = nn.Linear(HIDDEN_DIM, 1).to(device)
     
-    # Create optimizers
-    optimizer_g = optim.Adam([p for p in generator_params if p.requires_grad], lr=LEARNING_RATE, betas=(0.5, 0.9))
-    optimizer_c = optim.Adam([p for p in critic_params if p.requires_grad], lr=LEARNING_RATE, betas=(0.5, 0.9))
+    # Collect parameters for optimizers
+    generator_parameters = []
+    for module in gen_modules.values():
+        generator_parameters.extend(module.parameters())
     
-    # Training loop
+    critic_parameters = []
+    for module in critic_modules.values():
+        critic_parameters.extend(module.parameters())
+    
+    # Create optimizers with proper learning rates
+    optimizer_g = optim.Adam(generator_parameters, lr=LEARNING_RATE, betas=(0.5, 0.9))
+    optimizer_c = optim.Adam(critic_parameters, lr=LEARNING_RATE, betas=(0.5, 0.9))
+    
+    # Define a generator function that uses the modules
+    def generator_forward(z, cond):
+        # Combine noise and condition
+        h0 = torch.cat([z, cond], dim=1)
+        
+        # First hidden layer with skip connection
+        h1_part = F.relu(gen_modules['bn1'](gen_modules['fc1'](h0)))
+        h1 = torch.cat([h0, h1_part], dim=1)
+        
+        # Second hidden layer with skip connection
+        h2_part = F.relu(gen_modules['bn2'](gen_modules['fc2'](h1)))
+        h2 = torch.cat([h1, h2_part], dim=1)
+        
+        # Output layers
+        output_parts = []
+        
+        # Generate continuous normalized values using tanh
+        for i in range(continuous_dims):
+            alpha = torch.tanh(gen_modules[f'fc_alpha_{i}'](h2))
+            output_parts.append(alpha)
+        
+        # Generate mode indicators using gumbel softmax
+        for i, size in enumerate(mode_sizes):
+            beta = gumbel_softmax(gen_modules[f'fc_beta_{i}'](h2), temperature=0.2)
+            output_parts.append(beta)
+        
+        # Generate discrete values using gumbel softmax
+        for i, size in enumerate(categorical_dims):
+            d = gumbel_softmax(gen_modules[f'fc_d_{i}'](h2), temperature=0.2)
+            output_parts.append(d)
+        
+        # Concatenate all outputs
+        return torch.cat(output_parts, dim=1)
+    
+    # Define a critic function that uses the modules
+    def critic_forward(x, cond, pac_size=10):
+        # Reshape inputs for pac
+        batch_size = x.size(0) // pac_size
+        x = x.view(batch_size, pac_size * x.size(1))
+        cond = cond.view(batch_size, pac_size * cond.size(1))
+        
+        # Combine inputs and condition
+        h0 = torch.cat([x, cond], dim=1)
+        
+        # First hidden layer with dropout and leaky ReLU
+        h1 = F.leaky_relu(critic_modules['fc1'](h0), 0.2)
+        h1 = F.dropout(h1, 0.5, training=True)
+        
+        # Second hidden layer with dropout and leaky ReLU
+        h2 = F.leaky_relu(critic_modules['fc2'](h1), 0.2)
+        h2 = F.dropout(h2, 0.5, training=True)
+        
+        # Output layer
+        return critic_modules['fc3'](h2)
+    
+    # Function to compute gradient penalty
+    def compute_gradient_penalty(real_data, fake_data, cond, device):
+        batch_size = real_data.size(0)
+        alpha = torch.rand(batch_size, 1, device=device)
+        
+        # Interpolate between real and fake data
+        alpha = alpha.expand(real_data.size())
+        interpolates = alpha * real_data + (1 - alpha) * fake_data
+        interpolates.requires_grad_(True)
+        
+        # Calculate critic output for interpolated data
+        disc_interpolates = critic_forward(interpolates, cond)
+        
+        # Calculate gradients
+        gradients = torch.autograd.grad(
+            outputs=disc_interpolates, 
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(disc_interpolates, device=device),
+            create_graph=True, 
+            retain_graph=True
+        )[0]
+        
+        # Calculate gradient penalty
+        gradients = gradients.view(batch_size, -1)
+        gradient_norm = gradients.norm(2, dim=1)
+        gradient_penalty = ((gradient_norm - 1) ** 2).mean()
+        
+        return gradient_penalty
+    
+    # Modified training-by-sampling function
+    def sample_training_data(data_loader, data_loader_iter, categorical_dims, device):
+        # Get a batch of real data
+        try:
+            real_data, real_cond = next(data_loader_iter)
+        except StopIteration:
+            data_loader_iter = iter(data_loader)
+            real_data, real_cond = next(data_loader_iter)
+        
+        real_data = real_data.to(device)
+        real_cond = real_cond.to(device)
+        
+        # Create conditional vector for generator
+        batch_size = real_data.size(0)
+        cond = torch.zeros_like(real_cond)
+        
+        # For each sample, randomly select one discrete column
+        if len(categorical_dims) > 0:
+            for i in range(batch_size):
+                # Randomly select a categorical column
+                selected_col = np.random.randint(len(categorical_dims))
+                
+                # Create probability distribution based on log(frequency)
+                # For simplicity, we use uniform sampling here
+                col_start = sum(categorical_dims[:selected_col])
+                col_size = categorical_dims[selected_col]
+                col_val = np.random.randint(col_size)
+                
+                # Set the corresponding element to 1
+                cond[i, col_start + col_val] = 1
+        
+        return real_data, real_cond, cond, data_loader_iter
+    
+    # Initialize tracking variables
+    critic_losses = []
+    generator_losses = []
+    
+    # Apply weight initialization
+    for module in gen_modules.values():
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.constant_(module.bias, 0.0)
+    
+    for module in critic_modules.values():
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.constant_(module.bias, 0.0)
+    
+    # Training loop with stability improvements
     for epoch in range(EPOCHS):
+        # Track epoch losses
+        epoch_critic_losses = []
+        epoch_generator_losses = []
+        
         for i in range(len(data_loader)):
             # Train critic
             for _ in range(CRITIC_ITERS):
                 # Sample real data
-                real_data, real_cond, cond = sample_training_data(data_loader, categorical_dims, device)
+                real_data, real_cond, cond, data_loader_iter = sample_training_data(
+                    data_loader, data_loader_iter, categorical_dims, device)
                 
                 # Generate fake data
-                z = create_noise(BATCH_SIZE, Z_DIM, device)
-                fake_data = generator_network(z, cond, continuous_dims, mode_sizes, categorical_dims)
+                z = torch.randn(BATCH_SIZE, Z_DIM, device=device)
+                with torch.no_grad():  # Don't track gradients for generator during critic training
+                    fake_data = generator_forward(z, cond)
                 
                 # Calculate critic loss
-                real_critic = critic_network(real_data, real_cond)
-                fake_critic = critic_network(fake_data.detach(), cond)
+                real_critic = critic_forward(real_data, real_cond)
+                fake_critic = critic_forward(fake_data, cond)
                 
                 # Gradient penalty
-                gp = compute_gradient_penalty(critic_network, real_data, fake_data.detach(), cond, device)
+                gp = compute_gradient_penalty(real_data, fake_data, cond, device)
                 
-                # Wasserstein loss
+                # Wasserstein loss with stability term
                 critic_loss = torch.mean(fake_critic) - torch.mean(real_critic) + LAMBDA_GP * gp
                 
                 # Update critic
                 optimizer_c.zero_grad()
                 critic_loss.backward()
+                
+                # Apply gradient clipping to critic
+                torch.nn.utils.clip_grad_norm_(critic_parameters, max_norm=10.0)
                 optimizer_c.step()
+                
+                epoch_critic_losses.append(critic_loss.item())
             
             # Train generator
             # Sample conditions and generate fake data
-            _, _, cond = sample_training_data(data_loader, categorical_dims, device)
-            z = create_noise(BATCH_SIZE, Z_DIM, device)
-            fake_data = generator_network(z, cond, continuous_dims, mode_sizes, categorical_dims)
+            _, _, cond, data_loader_iter = sample_training_data(
+                data_loader, data_loader_iter, categorical_dims, device)
+            z = torch.randn(BATCH_SIZE, Z_DIM, device=device)
+            fake_data = generator_forward(z, cond)
             
             # Calculate generator loss
-            fake_critic = critic_network(fake_data, cond)
+            fake_critic = critic_forward(fake_data, cond)
             generator_loss = -torch.mean(fake_critic)
             
             # Add conditional loss if categorical columns exist
@@ -450,7 +603,7 @@ def train_ctgan(data, continuous_columns, categorical_columns, device='cuda'):
                     pred = cat_fake_data[:, current_pos:current_pos + dim]
                     
                     # Cross entropy between target and prediction
-                    cond_loss += F.binary_cross_entropy(pred, target)
+                    cond_loss += F.binary_cross_entropy(pred + 1e-8, target + 1e-8)
                     current_pos += dim
                 
                 generator_loss += LAMBDA_COND * cond_loss
@@ -458,11 +611,44 @@ def train_ctgan(data, continuous_columns, categorical_columns, device='cuda'):
             # Update generator
             optimizer_g.zero_grad()
             generator_loss.backward()
+            
+            # Apply gradient clipping to generator
+            torch.nn.utils.clip_grad_norm_(generator_parameters, max_norm=10.0)
             optimizer_g.step()
+            
+            epoch_generator_losses.append(generator_loss.item())
+        
+        # Calculate average losses for the epoch
+        avg_critic_loss = sum(epoch_critic_losses) / len(epoch_critic_losses) if epoch_critic_losses else 0
+        avg_generator_loss = sum(epoch_generator_losses) / len(epoch_generator_losses) if epoch_generator_losses else 0
+        
+        critic_losses.append(avg_critic_loss)
+        generator_losses.append(avg_generator_loss)
         
         # Print progress
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{EPOCHS}, G Loss: {generator_loss.item():.4f}, C Loss: {critic_loss.item():.4f}")
+            print(f"Epoch {epoch+1}/{EPOCHS}, G Loss: {avg_generator_loss:.4f}, C Loss: {avg_critic_loss:.4f}")
+            
+            # Check for NaN values
+            if np.isnan(avg_generator_loss) or np.isnan(avg_critic_loss):
+                print("NaN values detected - training has diverged. Stopping training.")
+                break
+            
+            # Check if losses are improving
+            if epoch > 50 and epoch % 50 == 0:
+                # Check if generator loss is improving
+                recent_g_loss = np.mean(generator_losses[-20:])
+                earlier_g_loss = np.mean(generator_losses[-50:-30])
+                
+                if abs(recent_g_loss - earlier_g_loss) < 0.01:
+                    print("Generator loss has plateaued. Consider adjusting learning rate or model parameters.")
+                
+                # Check if critic loss is improving
+                recent_c_loss = np.mean(critic_losses[-20:])
+                earlier_c_loss = np.mean(critic_losses[-50:-30])
+                
+                if abs(recent_c_loss - earlier_c_loss) < 0.01:
+                    print("Critic loss has plateaued. Consider adjusting learning rate or model parameters.")
     
     # Create a model dictionary to return
     model = {
@@ -476,12 +662,13 @@ def train_ctgan(data, continuous_columns, categorical_columns, device='cuda'):
         'mode_sizes': mode_sizes,
         'categorical_dims': categorical_dims,
         'cond_dim': cond_dim,
-        'generator_params': generator_params,
+        'gen_modules': gen_modules,
+        'generator_forward': generator_forward,
         'z_dim': Z_DIM,
         'device': device
     }
     
-    return model
+    return model, critic_losses, generator_losses
 
 def generate_samples(model, n_samples):
     """Generate synthetic samples using the trained model"""
@@ -494,24 +681,26 @@ def generate_samples(model, n_samples):
     mode_sizes = model['mode_sizes']
     categorical_dims = model['categorical_dims']
     cond_dim = model['cond_dim']
-    generator_params = model['generator_params']
+    gen_modules = model['gen_modules']
+    generator_forward = model['generator_forward']
     z_dim = model['z_dim']
     device = model['device']
     
     # Create random noise
-    z = create_noise(n_samples, z_dim, device)
+    z = torch.randn(n_samples, z_dim, device=device)
     
     # Create random conditions (for enterprise use, you may want to control this)
     cond = torch.zeros(n_samples, cond_dim, device=device)
-    for i in range(n_samples):
-        for j, dim in enumerate(categorical_dims):
-            col_start = sum(categorical_dims[:j])
-            col_val = np.random.randint(dim)
-            cond[i, col_start + col_val] = 1
+    if len(categorical_dims) > 0:
+        for i in range(n_samples):
+            for j, dim in enumerate(categorical_dims):
+                col_start = sum(categorical_dims[:j])
+                col_val = np.random.randint(dim)
+                cond[i, col_start + col_val] = 1
     
     # Generate data
     with torch.no_grad():
-        fake_data = generator_network(z, cond, continuous_dims, mode_sizes, categorical_dims)
+        fake_data = generator_forward(z, cond)
     
     # Convert to original format
     return inverse_transform(fake_data, continuous_columns, categorical_columns, 
@@ -528,7 +717,18 @@ if __name__ == "__main__":
     
     # Train model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = train_ctgan(data, continuous_columns, categorical_columns, device)
+    model, critic_losses, generator_losses = train_ctgan(data, continuous_columns, categorical_columns, device)
+    
+    # Plot training losses
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 5))
+    plt.plot(critic_losses, label='Critic Loss')
+    plt.plot(generator_losses, label='Generator Loss')
+    plt.legend()
+    plt.title('CTGAN Training Losses')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.savefig('training_losses.png')
     
     # Generate synthetic data
     synthetic_data = generate_samples(model, 1000)
