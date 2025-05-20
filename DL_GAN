@@ -1599,3 +1599,273 @@ def train_ctgan(data, continuous_columns, categorical_columns, date_columns=None
     }
     
     return model, critic_losses, generator_losses
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
+from sklearn.preprocessing import OneHotEncoder
+
+def fit_gaussian_mixture_models(data, continuous_columns, max_components=10, min_components=1):
+    """
+    Fit Gaussian Mixture Models to continuous columns with more stable configuration
+    """
+    gmms = {}
+    n_components = {}
+    
+    for column in continuous_columns:
+        column_data = data[column].values.reshape(-1, 1)
+        
+        # Handle potential NaN values
+        if np.isnan(column_data).any():
+            column_data = np.nan_to_num(column_data, nan=np.nanmean(column_data))
+        
+        # Add small noise to prevent singular covariance matrices
+        column_data += np.random.normal(0, 1e-6, size=column_data.shape)
+        
+        # Step 1: Use VGM to estimate number of modes with better configuration
+        vgm = BayesianGaussianMixture(
+            n_components=max_components,
+            weight_concentration_prior_type="dirichlet_process",
+            weight_concentration_prior=0.1,  # Less aggressive pruning
+            covariance_type="full",
+            n_init=10,  # More initializations for stability
+            max_iter=300,  # More iterations to ensure convergence
+            random_state=42
+        )
+        
+        try:
+            vgm.fit(column_data)
+            
+            # Count effective components (those with non-negligible weights)
+            effective_components = np.sum(vgm.weights_ > 0.02)  # Slightly higher threshold
+            effective_components = max(min_components, min(max_components, effective_components))
+            n_components[column] = effective_components
+            
+        except Exception as e:
+            print(f"Warning: BayesianGMM failed for column {column}. Using default 1 component. Error: {e}")
+            effective_components = 1
+            n_components[column] = 1
+        
+        # Step 2: Fit a regular GMM with the estimated number of components
+        gmm = GaussianMixture(
+            n_components=effective_components,
+            covariance_type="full",
+            n_init=10,
+            max_iter=300,
+            random_state=42
+        )
+        
+        try:
+            gmm.fit(column_data)
+            gmms[column] = gmm
+        except Exception as e:
+            print(f"Warning: GMM failed for column {column}. Using simpler model. Error: {e}")
+            # Fallback to a single Gaussian if GMM fails
+            gmm = GaussianMixture(n_components=1, covariance_type="full", random_state=42)
+            gmm.fit(column_data)
+            gmms[column] = gmm
+            n_components[column] = 1
+    
+    return gmms, n_components
+
+def normalize_continuous_columns(data, continuous_columns, gmms):
+    """
+    Apply mode-specific normalization with mode sampling rather than hard assignment
+    """
+    normalized_data = data.copy()
+    mode_indicators = {}
+    
+    for column in continuous_columns:
+        gmm = gmms[column]
+        values = data[column].values.reshape(-1, 1)
+        
+        # Handle potential NaNs
+        if np.isnan(values).any():
+            values = np.nan_to_num(values, nan=np.nanmean(values))
+        
+        # Compute probability densities for each mode
+        probs = gmm.predict_proba(values)
+        
+        # Sample modes probabilistically instead of argmax
+        # This helps prevent mode collapse in the generator
+        sampled_modes = np.zeros_like(probs)
+        for i in range(len(values)):
+            # Sample according to probability distribution
+            mode_idx = np.random.choice(gmm.n_components, p=probs[i])
+            sampled_modes[i, mode_idx] = 1
+        
+        selected_modes = np.argmax(sampled_modes, axis=1)
+        
+        # Normalize within the selected mode - use 3 instead of 4 for less aggressive scaling
+        means = gmm.means_.reshape(-1)
+        stds = np.sqrt(gmm.covariances_.reshape(gmm.n_components, -1)[:, 0])
+        
+        # Add small epsilon to prevent division by zero
+        stds = np.maximum(stds, 1e-6)
+        
+        normalized_values = np.zeros(len(values))
+        for mode_idx in range(gmm.n_components):
+            mode_filter = (selected_modes == mode_idx)
+            if np.any(mode_filter):
+                normalized_values[mode_filter] = ((values[mode_filter].reshape(-1) - means[mode_idx]) / 
+                                                (3 * stds[mode_idx]))
+        
+        normalized_data[column] = normalized_values
+        mode_indicators[column] = sampled_modes
+    
+    return normalized_data, mode_indicators
+
+def transform_data(data, continuous_columns, categorical_columns, gmms, encoders):
+    """Transform data for model input with improved handling"""
+    # Normalize continuous columns
+    normalized_data, mode_indicators = normalize_continuous_columns(data, continuous_columns, gmms)
+    
+    # Transform categorical columns using one-hot encoding
+    transformed_data = []
+    
+    # First, add normalized continuous data
+    for column in continuous_columns:
+        transformed_data.append(normalized_data[column].values.reshape(-1, 1))
+    
+    # Next, add mode indicators for continuous data
+    for column in continuous_columns:
+        transformed_data.append(mode_indicators[column])
+    
+    # Finally, add one-hot encoded categorical data
+    for column in categorical_columns:
+        encoder = encoders[column]
+        encoded = encoder.transform(data[column].values.reshape(-1, 1))
+        transformed_data.append(encoded)
+    
+    # Concatenate all components
+    return np.hstack(transformed_data)
+
+def inverse_transform(generated_data, continuous_columns, categorical_columns, gmms, encoders, n_continuous=None):
+    """Convert generated data back to original format with improved denormalization"""
+    data_dict = {}
+    
+    # Process continuous columns
+    current_idx = 0
+    cont_normalized_data = {}
+    mode_indicators = {}
+    
+    # Extract normalized values
+    for i, column in enumerate(continuous_columns):
+        cont_normalized_data[column] = generated_data[:, current_idx].detach().cpu().numpy() if hasattr(generated_data, 'detach') else generated_data[:, current_idx]
+        current_idx += 1
+    
+    # Extract mode indicators
+    for i, column in enumerate(continuous_columns):
+        gmm = gmms[column]
+        n_modes = gmm.n_components
+        
+        if hasattr(generated_data, 'detach'):
+            mode_data = generated_data[:, current_idx:current_idx + n_modes].detach().cpu().numpy()
+        else:
+            mode_data = generated_data[:, current_idx:current_idx + n_modes]
+            
+        mode_indicators[column] = mode_data
+        current_idx += n_modes
+    
+    # Denormalize continuous data - use the same scaling factor as in normalization
+    for column in continuous_columns:
+        gmm = gmms[column]
+        normalized_values = cont_normalized_data[column]
+        modes = np.argmax(mode_indicators[column], axis=1)
+        
+        means = gmm.means_.reshape(-1)
+        stds = np.sqrt(gmm.covariances_.reshape(gmm.n_components, -1)[:, 0])
+        
+        # Add small epsilon to prevent issues with tiny stds
+        stds = np.maximum(stds, 1e-6)
+        
+        denormalized = np.zeros_like(normalized_values)
+        for mode_idx in range(gmm.n_components):
+            mode_filter = (modes == mode_idx)
+            if np.any(mode_filter):
+                # Use 3 instead of 4 to match the normalization
+                denormalized[mode_filter] = (normalized_values[mode_filter] * 3 * stds[mode_idx]) + means[mode_idx]
+        
+        data_dict[column] = denormalized
+    
+    # Process categorical columns
+    for column in categorical_columns:
+        encoder = encoders[column]
+        n_categories = len(encoder.categories_[0])
+        
+        # Extract one-hot encoded data for this column
+        if hasattr(generated_data, 'detach'):
+            encoded_data = generated_data[:, current_idx:current_idx + n_categories].detach().cpu().numpy()
+        else:
+            encoded_data = generated_data[:, current_idx:current_idx + n_categories]
+            
+        current_idx += n_categories
+        
+        # Convert from one-hot back to categorical - apply temperature scaling before argmax
+        # This helps generated distributions match training distributions better
+        temperature = 0.8  # Adjust as needed (lower = sharper distributions)
+        softmax_encoded = np.exp(encoded_data / temperature)
+        softmax_encoded = softmax_encoded / softmax_encoded.sum(axis=1, keepdims=True)
+        categorical_data = np.argmax(softmax_encoded, axis=1)
+        
+        # Map from numeric indices back to original categories
+        original_categories = encoder.categories_[0]
+        data_dict[column] = np.array([original_categories[idx] for idx in categorical_data])
+    
+    return pd.DataFrame(data_dict)
+
+# Additional function to validate generated data against original
+def validate_distributions(original_df, generated_df, continuous_columns, categorical_columns):
+    """
+    Compare distributions between original and generated data
+    Returns a dictionary with statistical measures of the difference
+    """
+    validation_results = {}
+    
+    # Check continuous columns
+    for column in continuous_columns:
+        orig_values = original_df[column].values
+        gen_values = generated_df[column].values
+        
+        # Basic statistics
+        validation_results[column] = {
+            'mean_diff': np.mean(gen_values) - np.mean(orig_values),
+            'std_diff': np.std(gen_values) - np.std(orig_values),
+            'min_diff': np.min(gen_values) - np.min(orig_values),
+            'max_diff': np.max(gen_values) - np.max(orig_values),
+            'median_diff': np.median(gen_values) - np.median(orig_values)
+        }
+    
+    # Check categorical columns
+    for column in categorical_columns:
+        orig_counts = original_df[column].value_counts(normalize=True).to_dict()
+        gen_counts = generated_df[column].value_counts(normalize=True).to_dict()
+        
+        # Calculate JS divergence between distributions
+        all_categories = set(list(orig_counts.keys()) + list(gen_counts.keys()))
+        
+        # Initialize with small epsilon for categories not present
+        epsilon = 1e-10
+        p = np.array([orig_counts.get(cat, epsilon) for cat in all_categories])
+        q = np.array([gen_counts.get(cat, epsilon) for cat in all_categories])
+        
+        # Normalize
+        p = p / p.sum()
+        q = q / q.sum()
+        
+        # JS divergence
+        m = (p + q) / 2
+        js_div = 0.5 * (np.sum(p * np.log(p / m + epsilon)) + np.sum(q * np.log(q / m + epsilon)))
+        
+        validation_results[column] = {
+            'js_divergence': js_div,
+            'missing_categories': [cat for cat in orig_counts.keys() if cat not in gen_counts],
+            'new_categories': [cat for cat in gen_counts.keys() if cat not in orig_counts]
+        }
+    
+    return validation_results
