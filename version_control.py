@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 S3-Based Version Control System for EMR Workspaces
-A lightweight version control system using S3 with encryption
+A lightweight version control system using S3 with encryption.
+- Automatically detects EMR Cluster ID as workspace ID if running on EMR.
+- Allows specifying a repository root prefix within the S3 bucket.
+- Supports committing from local paths or S3 URIs.
 """
 
 import boto3
@@ -16,36 +19,72 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
+from urllib.parse import urlparse
 
 class S3VersionControl:
-    def __init__(self, bucket_name, passphrase, current_workspace_id):
+    def __init__(self, bucket_name, passphrase, current_workspace_id=None, repository_root_prefix="emr-shared-code-repo"):
         """
         Initialize S3 Version Control
         
         Args:
-            bucket_name: S3 bucket name for storing code
+            bucket_name: S3 bucket name for storing code (the target repository bucket)
             passphrase: Your secret passphrase for encryption
             current_workspace_id: Unique identifier for the *current* workspace.
-                                  This will be recorded as metadata for commits.
+                                  If None, attempts to detect EMR Cluster ID.
+            repository_root_prefix: The base prefix within the S3 bucket where this specific
+                                    version control repository's data will be stored.
+                                    (e.g., "my-project-vcs", "team-a/dev-repo")
         """
         self.bucket_name = bucket_name
-        self.current_workspace_id = current_workspace_id # Renamed for clarity
         self.s3_client = boto3.client('s3')
         
+        if current_workspace_id:
+            self.current_workspace_id = current_workspace_id
+        else:
+            self.current_workspace_id = self._get_emr_cluster_id()
+            if self.current_workspace_id:
+                print(f"Detected EMR Cluster ID: {self.current_workspace_id} as workspace ID.")
+            else:
+                self.current_workspace_id = "local-dev-unknown-workspace" # Fallback
+                print(f"Could not detect EMR Cluster ID. Using default workspace ID: {self.current_workspace_id}")
+        
+        # Ensure repository_root_prefix does not start or end with a '/'
+        self.repository_root_prefix = repository_root_prefix.strip('/')
+        if not self.repository_root_prefix:
+            # Fallback to default if somehow it becomes empty after stripping
+            self.repository_root_prefix = "emr-shared-code-repo" 
+        
+        # Base paths in S3 for THIS specific repository instance
+        self.versions_path = f"{self.repository_root_prefix}/versions"
+        self.metadata_path = f"{self.repository_root_prefix}/metadata"
+        self.branches_path = f"{self.repository_root_prefix}/branches" # Pointer for branches
+
         # Generate encryption key from passphrase
         self.cipher_suite = self._generate_cipher(passphrase)
-        
-        # Base paths in S3 for the SINGLE, SHARED repository
-        # This is the key change: no workspace_id here
-        self.base_repo_path = "emr-shared-code-repo" # Central repository path
-        self.versions_path = f"{self.base_repo_path}/versions"
-        self.metadata_path = f"{self.base_repo_path}/metadata"
-        self.branches_path = f"{self.base_repo_path}/branches" # Pointer for branches
+
+    def _get_emr_cluster_id(self):
+        """
+        Attempts to retrieve the EMR Cluster ID from the job-flow.json file.
+        Returns the cluster ID if found, otherwise None.
+        """
+        emr_info_file = "/mnt/var/lib/info/job-flow.json"
+        if os.path.exists(emr_info_file):
+            try:
+                with open(emr_info_file, 'r') as f:
+                    job_flow_info = json.load(f)
+                return job_flow_info.get('jobFlowId')
+            except Exception as e:
+                print(f"Warning: Could not read or parse {emr_info_file}: {e}")
+                return None
+        return None
 
     def _generate_cipher(self, passphrase):
         """Generate Fernet cipher from passphrase"""
         password = passphrase.encode()
-        salt = b'salt_for_consistency'  # In production, use random salt stored securely
+        # In production, for multiple clients sharing the same repo,
+        # the salt MUST be identical and securely known by all clients.
+        # For simplicity, using a fixed salt here.
+        salt = b'salt_for_consistency'
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
@@ -69,15 +108,15 @@ class S3VersionControl:
         """Calculate SHA256 hash of data"""
         return hashlib.sha256(data.encode() if isinstance(data, str) else data).hexdigest()
     
-    def _create_archive(self, source_path):
-        """Create zip archive of source directory"""
+    def _create_archive_from_local(self, source_path):
+        """Create zip archive of source directory from local file system"""
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             source_path = Path(source_path)
             
             if source_path.is_file():
                 zip_file.write(source_path, source_path.name)
-            else:
+            else: # If source_path is a directory
                 for file_path in source_path.rglob('*'):
                     if file_path.is_file():
                         relative_path = file_path.relative_to(source_path)
@@ -85,20 +124,94 @@ class S3VersionControl:
         
         buffer.seek(0)
         return buffer.getvalue()
-    
+
+    def _create_archive_from_s3(self, s3_source_uri: str) -> bytes:
+        """
+        Creates an in-memory zip archive from an S3 directory (prefix) or a single S3 file.
+        s3_source_uri should be like "s3://my-bucket/my-folder/" or "s3://my-bucket/my-file.txt"
+        """
+        parsed_uri = urlparse(s3_source_uri)
+        source_bucket = parsed_uri.netloc
+        source_key_prefix = parsed_uri.path.lstrip('/')
+
+        if not source_bucket:
+            raise ValueError(f"Invalid S3 URI: '{s3_source_uri}'. Missing bucket name.")
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # Check if it's a single file or a directory (prefix)
+            # A common heuristic: if it doesn't end with '/' and has a '.' in its name
+            if not source_key_prefix.endswith('/') and '.' in Path(source_key_prefix).name:
+                # Treat as a single file
+                try:
+                    obj_data = self.s3_client.get_object(Bucket=source_bucket, Key=source_key_prefix)['Body'].read()
+                    zip_file.writestr(Path(source_key_prefix).name, obj_data)
+                    print(f"Archived single S3 file: s3://{source_bucket}/{source_key_prefix}")
+                except self.s3_client.exceptions.NoSuchKey:
+                    raise FileNotFoundError(f"S3 object not found: s3://{source_bucket}/{source_key_prefix}")
+            else:
+                # Treat as a directory (prefix)
+                # Ensure prefix ends with '/' if it's a directory for consistent listing
+                if source_key_prefix and not source_key_prefix.endswith('/'):
+                    source_key_prefix += '/'
+
+                paginator = self.s3_client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=source_bucket, Prefix=source_key_prefix)
+                
+                found_files = 0
+                for page in pages:
+                    if "Contents" in page:
+                        for obj in page['Contents']:
+                            object_key = obj['Key']
+                            
+                            # Skip if it's just the prefix itself or an S3 directory marker
+                            if object_key == source_key_prefix or object_key.endswith('/'):
+                                continue
+
+                            # Calculate relative path within the zip archive
+                            relative_path = Path(object_key).relative_to(Path(source_key_prefix))
+
+                            # print(f"  Adding {object_key} (as {relative_path}) to archive...") # Uncomment for verbose logging
+                            
+                            # Download object content
+                            try:
+                                obj_data = self.s3_client.get_object(Bucket=source_bucket, Key=object_key)['Body'].read()
+                                # Add to zip with its relative path
+                                zip_file.writestr(str(relative_path), obj_data)
+                                found_files += 1
+                            except self.s3_client.exceptions.NoSuchKey:
+                                print(f"Warning: S3 object s3://{source_bucket}/{object_key} disappeared during archiving. Skipping.")
+                
+                if found_files == 0:
+                    raise FileNotFoundError(f"No files found under S3 prefix: s3://{source_bucket}/{source_key_prefix}")
+                
+                print(f"Archived {found_files} files from S3 prefix: s3://{source_bucket}/{source_key_prefix}")
+
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue() # Return bytes
+
     def commit(self, source_path, commit_message, branch="main"):
         """
         Commit code to the shared S3 repository
         
         Args:
-            source_path: Path to code directory or file
+            source_path: Path to code directory/file (local) or S3 URI (s3://bucket/prefix/)
             commit_message: Commit message
             branch: Branch name (default: main)
         """
         try:
-            # Create archive
-            archive_data = self._create_archive(source_path)
+            archive_data = None
+            if source_path.startswith("s3://"):
+                print(f"Committing from S3 location: {source_path}")
+                archive_data = self._create_archive_from_s3(source_path)
+            else:
+                print(f"Committing from local path: {source_path}")
+                archive_data = self._create_archive_from_local(source_path)
             
+            if archive_data is None or len(archive_data) == 0:
+                print(f"❌ Error: No data archived from {source_path}. Aborting commit.")
+                return None
+
             # Generate version info
             timestamp = datetime.datetime.now().isoformat()
             version_hash = self._calculate_hash(archive_data)
@@ -110,7 +223,9 @@ class S3VersionControl:
                 'commit_message': commit_message,
                 'branch': branch,
                 'hash': version_hash,
-                'size': len(archive_data)
+                'size': len(archive_data),
+                'source_type': 's3' if source_path.startswith("s3://") else 'local',
+                'original_source_path': source_path # Store original source for audit
             }
             
             # Encrypt archive
@@ -151,9 +266,17 @@ class S3VersionControl:
             print(f"    Message: {commit_message}")
             print(f"    Timestamp: {timestamp}")
             print(f"    Committed by Workspace: {self.current_workspace_id}")
+            print(f"    Source: {source_path}")
+            print(f"    Repository Root: s3://{self.bucket_name}/{self.repository_root_prefix}/")
             
             return version_hash
             
+        except FileNotFoundError as e:
+            print(f"❌ Error: Source not found: {e}")
+            return None
+        except ValueError as e:
+            print(f"❌ Configuration Error: {e}")
+            return None
         except Exception as e:
             print(f"❌ Error during commit: {e}")
             return None
@@ -172,7 +295,7 @@ class S3VersionControl:
             if not version_hash:
                 version_hash = self._get_latest_version(branch)
                 if not version_hash:
-                    print(f"❌ No versions found for branch '{branch}' in the shared repository")
+                    print(f"❌ No versions found for branch '{branch}' in the shared repository located at s3://{self.bucket_name}/{self.repository_root_prefix}/")
                     return False
             
             # Download encrypted archive from the shared versions path
@@ -194,6 +317,7 @@ class S3VersionControl:
             print(f"    Version: {version_hash[:8]}")
             print(f"    Branch: {branch}")
             print(f"    Target: {target_path}")
+            print(f"    Repository Root: s3://{self.bucket_name}/{self.repository_root_prefix}/")
             
             return True
             
@@ -208,8 +332,10 @@ class S3VersionControl:
             response = self.s3_client.get_object(Bucket=self.bucket_name, Key=branch_key)
             branch_info = json.loads(response['Body'].read())
             return branch_info['latest_hash']
+        except self.s3_client.exceptions.NoSuchKey:
+            return None # Branch pointer doesn't exist yet
         except Exception as e:
-            print(f"Warning: Could not retrieve latest version for branch '{branch}'. {e}")
+            print(f"Warning: Could not retrieve latest version for branch '{branch}' from s3://{self.bucket_name}/{self.repository_root_prefix}/. {e}")
             return None
     
     def list_versions(self, branch="main", filter_by_workspace_id=None):
@@ -225,7 +351,7 @@ class S3VersionControl:
             )
             
             if 'Contents' not in response:
-                print(f"No versions found for branch '{branch}' in the shared repository.")
+                print(f"No versions found for branch '{branch}' in the shared repository located at s3://{self.bucket_name}/{self.repository_root_prefix}/")
                 return []
             
             versions = []
@@ -246,7 +372,7 @@ class S3VersionControl:
             # Sort by timestamp (newest first)
             versions.sort(key=lambda x: x['timestamp'], reverse=True)
             
-            print(f"📋 Version History for branch '{branch}' (Shared Repository):")
+            print(f"📋 Version History for branch '{branch}' (Shared Repository at s3://{self.bucket_name}/{self.repository_root_prefix}/):")
             if filter_by_workspace_id:
                 print(f"(Filtered by Workspace ID: {filter_by_workspace_id})")
             print("-" * 80)
@@ -254,7 +380,9 @@ class S3VersionControl:
                 print(f"Hash: {version['hash'][:8]}")
                 print(f"Date: {version['timestamp']}")
                 print(f"Message: {version['commit_message']}")
-                print(f"Committed by Workspace: {version.get('committer_workspace_id', 'N/A')}") # Use .get for robustness
+                print(f"Committed by Workspace: {version.get('committer_workspace_id', 'N/A')}")
+                print(f"Source Type: {version.get('source_type', 'N/A')}")
+                print(f"Original Source: {version.get('original_source_path', 'N/A')[:60]}...")
                 print("-" * 40)
             
             return versions
@@ -263,15 +391,11 @@ class S3VersionControl:
             print(f"❌ Error listing versions: {e}")
             return []
     
-    # The 'sync_from_workspace' method is no longer needed in its original form
-    # as all workspaces will interact with the single shared repository.
-    # If you need to "sync" in the new model, it's just a 'checkout' of the latest.
     def pull_latest(self, target_path, branch="main"):
         """
         Pulls the latest version from the shared repository for a given branch.
-        This effectively replaces the 'sync_from_workspace' logic.
         """
-        print(f"Attempting to pull latest for branch '{branch}' to '{target_path}'...")
+        print(f"Attempting to pull latest for branch '{branch}' to '{target_path}' from s3://{self.bucket_name}/{self.repository_root_prefix}/...")
         return self.checkout(target_path, branch)
 
 # Usage examples and CLI interface
@@ -279,33 +403,36 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='S3 Version Control System for Shared EMR Workspaces')
-    parser.add_argument('--bucket', required=True, help='S3 bucket name')
-    # Renamed from --workspace to --current-workspace-id for clarity in shared repo model
-    parser.add_argument('--current-workspace-id', required=True, help='ID of the current EMR Workspace interacting with the shared repo')
+    parser.add_argument('--bucket', required=True, help='S3 bucket name (the main bucket)')
     parser.add_argument('--passphrase', required=True, help='Encryption passphrase')
+    # new argument for repository root prefix
+    parser.add_argument('--repo-prefix', default='emr-shared-code-repo', 
+                        help='Optional: The prefix/folder inside the S3 bucket where this VCS instance resides (default: emr-shared-code-repo)')
+    # current_workspace_id is now optional
+    parser.add_argument('--current-workspace-id', help='Optional: ID of the current EMR Workspace. If not provided, attempts to auto-detect EMR Cluster ID.')
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # Commit command
-    commit_parser = subparsers.add_parser('commit', help='Commit code to the shared repository')
-    commit_parser.add_argument('path', help='Path to code directory/file to commit')
+    commit_parser = subparsers.add_parser('commit', help='Commit code to the shared repository (can be local path or s3:// URI)')
+    commit_parser.add_argument('path', help='Path to code directory/file (local) OR S3 URI (e.g., s3://my-source-bucket/my-folder/)')
     commit_parser.add_argument('-m', '--message', required=True, help='Commit message')
     commit_parser.add_argument('-b', '--branch', default='main', help='Branch name')
     
     # Checkout command
     checkout_parser = subparsers.add_parser('checkout', help='Checkout code from the shared repository')
-    checkout_parser.add_argument('path', help='Target path for checkout')
+    checkout_parser.add_argument('path', help='Target local path for checkout')
     checkout_parser.add_argument('-b', '--branch', default='main', help='Branch name')
-    checkout_parser.add_argument('-v', '--version', help='Specific version hash (optional, defaults to latest)')
+    checkout_parser.add_argument('-v', '--version', help='Specific version hash')
     
     # List command
     list_parser = subparsers.add_parser('list', help='List versions in the shared repository')
     list_parser.add_argument('-b', '--branch', default='main', help='Branch name')
     list_parser.add_argument('--filter-workspace', help='Optional: Filter versions by the workspace ID that committed them')
     
-    # Pull command (replaces sync for shared repo)
+    # Pull command
     pull_parser = subparsers.add_parser('pull', help='Pull the latest code from the shared repository')
-    pull_parser.add_argument('path', help='Target path for pulling the latest code')
+    pull_parser.add_argument('path', help='Target local path for pulling the latest code')
     pull_parser.add_argument('-b', '--branch', default='main', help='Branch name')
     
     args = parser.parse_args()
@@ -314,8 +441,8 @@ def main():
         parser.print_help()
         return
     
-    # Initialize version control with the current workspace's ID
-    vc = S3VersionControl(args.bucket, args.passphrase, args.current_workspace_id)
+    # Initialize version control with the new repo_prefix
+    vc = S3VersionControl(args.bucket, args.passphrase, args.current_workspace_id, args.repo_prefix)
     
     # Execute command
     if args.command == 'commit':
