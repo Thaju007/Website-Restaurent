@@ -18,27 +18,30 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 
 class S3VersionControl:
-    def __init__(self, bucket_name, passphrase, workspace_id):
+    def __init__(self, bucket_name, passphrase, current_workspace_id):
         """
         Initialize S3 Version Control
         
         Args:
             bucket_name: S3 bucket name for storing code
             passphrase: Your secret passphrase for encryption
-            workspace_id: Unique identifier for your workspace (e.g., 'workspace1', 'workspace2')
+            current_workspace_id: Unique identifier for the *current* workspace.
+                                  This will be recorded as metadata for commits.
         """
         self.bucket_name = bucket_name
-        self.workspace_id = workspace_id
+        self.current_workspace_id = current_workspace_id # Renamed for clarity
         self.s3_client = boto3.client('s3')
         
         # Generate encryption key from passphrase
         self.cipher_suite = self._generate_cipher(passphrase)
         
-        # Base paths in S3
-        self.base_path = f"code-repo/{workspace_id}"
-        self.versions_path = f"{self.base_path}/versions"
-        self.metadata_path = f"{self.base_path}/metadata"
-        
+        # Base paths in S3 for the SINGLE, SHARED repository
+        # This is the key change: no workspace_id here
+        self.base_repo_path = "emr-shared-code-repo" # Central repository path
+        self.versions_path = f"{self.base_repo_path}/versions"
+        self.metadata_path = f"{self.base_repo_path}/metadata"
+        self.branches_path = f"{self.base_repo_path}/branches" # Pointer for branches
+
     def _generate_cipher(self, passphrase):
         """Generate Fernet cipher from passphrase"""
         password = passphrase.encode()
@@ -85,7 +88,7 @@ class S3VersionControl:
     
     def commit(self, source_path, commit_message, branch="main"):
         """
-        Commit code to S3 repository
+        Commit code to the shared S3 repository
         
         Args:
             source_path: Path to code directory or file
@@ -100,9 +103,9 @@ class S3VersionControl:
             timestamp = datetime.datetime.now().isoformat()
             version_hash = self._calculate_hash(archive_data)
             
-            # Create metadata
+            # Create metadata (now includes 'committer_workspace_id')
             metadata = {
-                'workspace_id': self.workspace_id,
+                'committer_workspace_id': self.current_workspace_id, # This workspace made the commit
                 'timestamp': timestamp,
                 'commit_message': commit_message,
                 'branch': branch,
@@ -113,7 +116,7 @@ class S3VersionControl:
             # Encrypt archive
             encrypted_archive = self._encrypt_data(archive_data)
             
-            # Upload encrypted archive
+            # Upload encrypted archive to the shared versions path
             version_key = f"{self.versions_path}/{branch}/{version_hash}.zip.enc"
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
@@ -121,7 +124,7 @@ class S3VersionControl:
                 Body=encrypted_archive
             )
             
-            # Upload metadata
+            # Upload metadata to the shared metadata path
             metadata_key = f"{self.metadata_path}/{branch}/{version_hash}.json"
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
@@ -129,12 +132,12 @@ class S3VersionControl:
                 Body=json.dumps(metadata, indent=2)
             )
             
-            # Update branch pointer
-            branch_key = f"{self.base_path}/branches/{branch}.json"
+            # Update branch pointer in the shared branches path
+            branch_key = f"{self.branches_path}/{branch}.json"
             branch_info = {
                 'latest_hash': version_hash,
                 'latest_timestamp': timestamp,
-                'workspace_id': self.workspace_id
+                'last_committed_by_workspace_id': self.current_workspace_id # Record who last updated the branch pointer
             }
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
@@ -142,11 +145,12 @@ class S3VersionControl:
                 Body=json.dumps(branch_info, indent=2)
             )
             
-            print(f"✅ Committed successfully!")
-            print(f"   Version: {version_hash[:8]}")
-            print(f"   Branch: {branch}")
-            print(f"   Message: {commit_message}")
-            print(f"   Timestamp: {timestamp}")
+            print(f"✅ Committed successfully to shared repository!")
+            print(f"    Version: {version_hash[:8]}")
+            print(f"    Branch: {branch}")
+            print(f"    Message: {commit_message}")
+            print(f"    Timestamp: {timestamp}")
+            print(f"    Committed by Workspace: {self.current_workspace_id}")
             
             return version_hash
             
@@ -156,7 +160,7 @@ class S3VersionControl:
     
     def checkout(self, target_path, branch="main", version_hash=None):
         """
-        Checkout code from S3 repository
+        Checkout code from the shared S3 repository
         
         Args:
             target_path: Path where to extract code
@@ -164,14 +168,14 @@ class S3VersionControl:
             version_hash: Specific version hash (optional, defaults to latest)
         """
         try:
-            # Get version hash if not provided
+            # Get version hash if not provided (from the shared branch pointer)
             if not version_hash:
                 version_hash = self._get_latest_version(branch)
                 if not version_hash:
-                    print(f"❌ No versions found for branch '{branch}'")
+                    print(f"❌ No versions found for branch '{branch}' in the shared repository")
                     return False
             
-            # Download encrypted archive
+            # Download encrypted archive from the shared versions path
             version_key = f"{self.versions_path}/{branch}/{version_hash}.zip.enc"
             response = self.s3_client.get_object(Bucket=self.bucket_name, Key=version_key)
             encrypted_data = response['Body'].read()
@@ -186,10 +190,10 @@ class S3VersionControl:
             with zipfile.ZipFile(io.BytesIO(decrypted_data), 'r') as zip_file:
                 zip_file.extractall(target_path)
             
-            print(f"✅ Checkout successful!")
-            print(f"   Version: {version_hash[:8]}")
-            print(f"   Branch: {branch}")
-            print(f"   Target: {target_path}")
+            print(f"✅ Checkout successful from shared repository!")
+            print(f"    Version: {version_hash[:8]}")
+            print(f"    Branch: {branch}")
+            print(f"    Target: {target_path}")
             
             return True
             
@@ -198,17 +202,21 @@ class S3VersionControl:
             return False
     
     def _get_latest_version(self, branch):
-        """Get latest version hash for a branch"""
+        """Get latest version hash for a branch from the shared branch pointer"""
         try:
-            branch_key = f"{self.base_path}/branches/{branch}.json"
+            branch_key = f"{self.branches_path}/{branch}.json"
             response = self.s3_client.get_object(Bucket=self.bucket_name, Key=branch_key)
             branch_info = json.loads(response['Body'].read())
             return branch_info['latest_hash']
-        except:
+        except Exception as e:
+            print(f"Warning: Could not retrieve latest version for branch '{branch}'. {e}")
             return None
     
-    def list_versions(self, branch="main"):
-        """List all versions in a branch"""
+    def list_versions(self, branch="main", filter_by_workspace_id=None):
+        """
+        List all versions in a branch from the shared repository.
+        Can optionally filter by the workspace ID that made the commit.
+        """
         try:
             prefix = f"{self.metadata_path}/{branch}/"
             response = self.s3_client.list_objects_v2(
@@ -217,7 +225,7 @@ class S3VersionControl:
             )
             
             if 'Contents' not in response:
-                print(f"No versions found for branch '{branch}'")
+                print(f"No versions found for branch '{branch}' in the shared repository.")
                 return []
             
             versions = []
@@ -228,18 +236,25 @@ class S3VersionControl:
                     Key=obj['Key']
                 )
                 metadata = json.loads(metadata_response['Body'].read())
+                
+                # Apply workspace filter if provided
+                if filter_by_workspace_id and metadata.get('committer_workspace_id') != filter_by_workspace_id:
+                    continue
+                
                 versions.append(metadata)
             
             # Sort by timestamp (newest first)
             versions.sort(key=lambda x: x['timestamp'], reverse=True)
             
-            print(f"📋 Version History for branch '{branch}':")
+            print(f"📋 Version History for branch '{branch}' (Shared Repository):")
+            if filter_by_workspace_id:
+                print(f"(Filtered by Workspace ID: {filter_by_workspace_id})")
             print("-" * 80)
             for version in versions:
                 print(f"Hash: {version['hash'][:8]}")
                 print(f"Date: {version['timestamp']}")
                 print(f"Message: {version['commit_message']}")
-                print(f"Workspace: {version['workspace_id']}")
+                print(f"Committed by Workspace: {version.get('committer_workspace_id', 'N/A')}") # Use .get for robustness
                 print("-" * 40)
             
             return versions
@@ -248,98 +263,50 @@ class S3VersionControl:
             print(f"❌ Error listing versions: {e}")
             return []
     
-    def sync_from_workspace(self, other_workspace_id, branch="main"):
+    # The 'sync_from_workspace' method is no longer needed in its original form
+    # as all workspaces will interact with the single shared repository.
+    # If you need to "sync" in the new model, it's just a 'checkout' of the latest.
+    def pull_latest(self, target_path, branch="main"):
         """
-        Sync code from another workspace
-        
-        Args:
-            other_workspace_id: ID of the workspace to sync from
-            branch: Branch to sync
+        Pulls the latest version from the shared repository for a given branch.
+        This effectively replaces the 'sync_from_workspace' logic.
         """
-        try:
-            # Get latest version from other workspace
-            other_branch_key = f"code-repo/{other_workspace_id}/branches/{branch}.json"
-            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=other_branch_key)
-            other_branch_info = json.loads(response['Body'].read())
-            
-            version_hash = other_branch_info['latest_hash']
-            
-            # Copy version files to current workspace
-            source_version_key = f"code-repo/{other_workspace_id}/versions/{branch}/{version_hash}.zip.enc"
-            target_version_key = f"{self.versions_path}/{branch}/{version_hash}.zip.enc"
-            
-            # Copy encrypted archive
-            self.s3_client.copy_object(
-                Bucket=self.bucket_name,
-                CopySource={'Bucket': self.bucket_name, 'Key': source_version_key},
-                Key=target_version_key
-            )
-            
-            # Copy metadata
-            source_metadata_key = f"code-repo/{other_workspace_id}/metadata/{branch}/{version_hash}.json"
-            target_metadata_key = f"{self.metadata_path}/{branch}/{version_hash}.json"
-            
-            self.s3_client.copy_object(
-                Bucket=self.bucket_name,
-                CopySource={'Bucket': self.bucket_name, 'Key': source_metadata_key},
-                Key=target_metadata_key
-            )
-            
-            # Update branch pointer
-            branch_key = f"{self.base_path}/branches/{branch}.json"
-            branch_info = {
-                'latest_hash': version_hash,
-                'latest_timestamp': other_branch_info['latest_timestamp'],
-                'workspace_id': self.workspace_id,
-                'synced_from': other_workspace_id
-            }
-            self.s3_client.put_object(
-                Bucket=self.bucket_name,
-                Key=branch_key,
-                Body=json.dumps(branch_info, indent=2)
-            )
-            
-            print(f"✅ Synced from workspace '{other_workspace_id}'!")
-            print(f"   Version: {version_hash[:8]}")
-            print(f"   Branch: {branch}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error during sync: {e}")
-            return False
+        print(f"Attempting to pull latest for branch '{branch}' to '{target_path}'...")
+        return self.checkout(target_path, branch)
 
 # Usage examples and CLI interface
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='S3 Version Control System')
+    parser = argparse.ArgumentParser(description='S3 Version Control System for Shared EMR Workspaces')
     parser.add_argument('--bucket', required=True, help='S3 bucket name')
-    parser.add_argument('--workspace', required=True, help='Workspace ID')
+    # Renamed from --workspace to --current-workspace-id for clarity in shared repo model
+    parser.add_argument('--current-workspace-id', required=True, help='ID of the current EMR Workspace interacting with the shared repo')
     parser.add_argument('--passphrase', required=True, help='Encryption passphrase')
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # Commit command
-    commit_parser = subparsers.add_parser('commit', help='Commit code')
-    commit_parser.add_argument('path', help='Path to code directory/file')
+    commit_parser = subparsers.add_parser('commit', help='Commit code to the shared repository')
+    commit_parser.add_argument('path', help='Path to code directory/file to commit')
     commit_parser.add_argument('-m', '--message', required=True, help='Commit message')
     commit_parser.add_argument('-b', '--branch', default='main', help='Branch name')
     
     # Checkout command
-    checkout_parser = subparsers.add_parser('checkout', help='Checkout code')
+    checkout_parser = subparsers.add_parser('checkout', help='Checkout code from the shared repository')
     checkout_parser.add_argument('path', help='Target path for checkout')
     checkout_parser.add_argument('-b', '--branch', default='main', help='Branch name')
-    checkout_parser.add_argument('-v', '--version', help='Specific version hash')
+    checkout_parser.add_argument('-v', '--version', help='Specific version hash (optional, defaults to latest)')
     
     # List command
-    list_parser = subparsers.add_parser('list', help='List versions')
+    list_parser = subparsers.add_parser('list', help='List versions in the shared repository')
     list_parser.add_argument('-b', '--branch', default='main', help='Branch name')
+    list_parser.add_argument('--filter-workspace', help='Optional: Filter versions by the workspace ID that committed them')
     
-    # Sync command
-    sync_parser = subparsers.add_parser('sync', help='Sync from another workspace')
-    sync_parser.add_argument('workspace', help='Source workspace ID')
-    sync_parser.add_argument('-b', '--branch', default='main', help='Branch name')
+    # Pull command (replaces sync for shared repo)
+    pull_parser = subparsers.add_parser('pull', help='Pull the latest code from the shared repository')
+    pull_parser.add_argument('path', help='Target path for pulling the latest code')
+    pull_parser.add_argument('-b', '--branch', default='main', help='Branch name')
     
     args = parser.parse_args()
     
@@ -347,8 +314,8 @@ def main():
         parser.print_help()
         return
     
-    # Initialize version control
-    vc = S3VersionControl(args.bucket, args.passphrase, args.workspace)
+    # Initialize version control with the current workspace's ID
+    vc = S3VersionControl(args.bucket, args.passphrase, args.current_workspace_id)
     
     # Execute command
     if args.command == 'commit':
@@ -356,9 +323,9 @@ def main():
     elif args.command == 'checkout':
         vc.checkout(args.path, args.branch, args.version)
     elif args.command == 'list':
-        vc.list_versions(args.branch)
-    elif args.command == 'sync':
-        vc.sync_from_workspace(args.workspace, args.branch)
+        vc.list_versions(args.branch, args.filter_workspace)
+    elif args.command == 'pull':
+        vc.pull_latest(args.path, args.branch)
 
 if __name__ == "__main__":
     main()
