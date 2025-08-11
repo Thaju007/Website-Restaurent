@@ -328,3 +328,42 @@ class TabularDataTransformer:
             print(f"[WGAN-GP] Epoch [{epoch+1}/{epochs}] Loss_C: {loss_C.item():.4f} Loss_G: {loss_G.item():.4f}")
             save_model_to_s3(G, optimizer_G, epoch+1, s3_bucket, f"{s3_prefix}/wgan_G_epoch{epoch+1}.pth")
             save_model_to_s3(C, optimizer_C, epoch+1, s3_bucket, f"{s3_prefix}/wgan_C_epoch{epoch+1}.pth")
+
+
+
+
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+class TabularTransformer:
+    def __init__(self, categorical_cols, continuous_cols):
+        self.categorical_cols = categorical_cols
+        self.continuous_cols = continuous_cols
+        self.ohe = OneHotEncoder(sparse=False, handle_unknown="ignore")
+        self.scaler = StandardScaler()
+
+    def fit_transform(self, df):
+        cat_data = self.ohe.fit_transform(df[self.categorical_cols])
+        cont_data = self.scaler.fit_transform(df[self.continuous_cols])
+        return np.hstack([cat_data, cont_data])
+
+    def transform(self, df):
+        cat_data = self.ohe.transform(df[self.categorical_cols])
+        cont_data = self.scaler.transform(df[self.continuous_cols])
+        return np.hstack([cat_data, cont_data])
+
+    def inverse_transform(self, data):
+        n_cat_features = len(self.ohe.get_feature_names_out())
+        cat_data = data[:, :n_cat_features]
+        cont_data = data[:, n_cat_features:]
+
+        cat_original = self.ohe.inverse_transform(cat_data)
+        cont_original = self.scaler.inverse_transform(cont_data)
+
+        df_cat = pd.DataFrame(cat_original, columns=self.categorical_cols)
+        df_cont = pd.DataFrame(cont_original, columns=self.continuous_cols)
+
+        return pd.concat([df_cat, df_cont], axis=1)
+
