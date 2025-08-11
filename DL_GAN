@@ -1,852 +1,253 @@
 import torch
+import boto3
+import os
+
+def save_model_to_s3(model, optimizer, epoch, s3_bucket, s3_key, local_path="checkpoint.pth"):
+    # Save locally
+    torch.save({
+        'epoch': epoch,
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict()
+    }, local_path)
+    
+    # Upload to S3
+    s3 = boto3.client('s3')
+    s3.upload_file(local_path, s3_bucket, s3_key)
+    print(f"Saved checkpoint to s3://{s3_bucket}/{s3_key}")
+
+def load_model_from_s3(model, optimizer, s3_bucket, s3_key, local_path="checkpoint.pth"):
+    # Download from S3
+    s3 = boto3.client('s3')
+    s3.download_file(s3_bucket, s3_key, local_path)
+    
+    checkpoint = torch.load(local_path, map_location=torch.device('cpu'))
+    model.load_state_dict(checkpoint['model_state'])
+    optimizer.load_state_dict(checkpoint['optimizer_state'])
+    print(f"Loaded checkpoint from s3://{s3_bucket}/{s3_key}, epoch {checkpoint['epoch']}")
+    return checkpoint['epoch']
+
+
+
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.mixture import GaussianMixture
-import matplotlib.pyplot as plt
-import seaborn as sns
-import scipy.stats
-from torch.utils.data import DataLoader, TensorDataset
-import os
-from datetime import datetime
 
-# Ensure reproducible results
-torch.manual_seed(42)
-np.random.seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
-
-# --- Helper Module: GumbelSoftmax ---
-# This is a differentiable approximation of argmax for categorical data
-class GumbelSoftmax(nn.Module):
-    def __init__(self, temperature=1.0, hard=False):
-        super(GumbelSoftmax, self).__init__()
-        self.temperature = temperature
-        self.hard = hard
-
-    def forward(self, logits):
-        # Gumbel-Softmax trick: G = -log(-log(U))
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-20) + 1e-20)
-        y = logits + gumbel_noise
-        y = torch.softmax(y / self.temperature, dim=-1)
-
-        if self.hard:
-            # For hard (one-hot) output during inference
-            y_hard = torch.zeros_like(y)
-            # Get the one-hot index
-            y_hard.scatter_(-1, y.argmax(dim=-1, keepdim=True), 1.0)
-            # Straight-through estimator: G.backward() will use y's gradients
-            y = y_hard - y.detach() + y
-        return y
-
-# --- CTGANGenerator (replaces WGANGenerator) ---
-class CTGANGenerator(nn.Module):
-    """
-    CTGAN Generator for tabular data with conditional input and Gumbel-Softmax output.
-    """
-    def __init__(self, noise_dim, data_dim, cond_dim, hidden_dims=[128, 256, 128]):
-        super(CTGANGenerator, self).__init__()
-
-        self.data_dim = data_dim # Full transformed data dimension
-        self.cond_dim = cond_dim # Dimension of the conditional vector
-
-        layers = []
-        # Input to the first layer is noise + conditional vector
-        prev_dim = noise_dim + cond_dim
-
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU()
-            ])
-            prev_dim = hidden_dim
-
-        # Output layer will produce logits for all features (continuous and categorical)
-        layers.append(nn.Linear(prev_dim, data_dim)) # No activation here yet
-
-        self.network = nn.Sequential(*layers)
-        # GumbelSoftmax is applied conditionally in the forward pass based on feature types
-        self.gumbel_softmax = GumbelSoftmax(temperature=0.7, hard=True) # CTGAN uses hard for inference
-
-    def forward(self, noise, cond_vector, column_info):
-        """
-        Generates synthetic data conditioned on cond_vector.
-
-        Args:
-            noise (torch.Tensor): Random noise vector.
-            cond_vector (torch.Tensor): One-hot encoded conditional vector.
-            column_info (list): Metadata from preprocessor to interpret output dimensions.
-                                Each tuple: (col_name, type, original_dim, transformed_dim_start, transformed_dim_end)
-        """
-        # Concatenate noise and conditional vector
-        combined_input = torch.cat((noise, cond_vector), dim=1)
-        logits = self.network(combined_input)
-
-        # Apply appropriate activations based on column_info
-        output_data = torch.empty_like(logits)
-        for col_name, col_type, _, start_idx, end_idx in column_info:
-            if col_type == 'continuous':
-                # Continuous columns use Tanh
-                output_data[:, start_idx:end_idx] = torch.tanh(logits[:, start_idx:end_idx])
-            elif col_type == 'categorical':
-                # Categorical columns use Gumbel-Softmax
-                # The size of the categorical one-hot part is end_idx - start_idx
-                num_categories = end_idx - start_idx
-                # Reshape logits for GumbelSoftmax if necessary (if there are multiple categorical cols)
-                # Here, logits[:, start_idx:end_idx] directly represents the logits for this one-hot segment
-                output_data[:, start_idx:end_idx] = self.gumbel_softmax(logits[:, start_idx:end_idx])
-        return output_data
-
-# --- CTGANCritic (replaces WGANCritic) ---
-class CTGANCritic(nn.Module):
-    """
-    CTGAN Critic (Discriminator) for tabular data with conditional input.
-    """
-    def __init__(self, data_dim, cond_dim, hidden_dims=[128, 256, 128]):
-        super(CTGANCritic, self).__init__()
-
-        layers = []
-        # Input to the first layer is data + conditional vector
-        prev_dim = data_dim + cond_dim
-
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.2)
-            ])
-            prev_dim = hidden_dim
-
-        layers.append(nn.Linear(prev_dim, 1)) # No activation
-
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x, cond_vector):
-        """
-        Evaluates data conditioned on cond_vector.
-
-        Args:
-            x (torch.Tensor): Data (real or fake).
-            cond_vector (torch.Tensor): One-hot encoded conditional vector.
-        """
-        # Concatenate data and conditional vector
-        combined_input = torch.cat((x, cond_vector), dim=1)
-        return self.network(combined_input)
-
-# --- Updated TabularDataPreprocessor ---
-class TabularDataPreprocessor:
-    """
-    Data preprocessor implementing CTGAN-like mode-based normalization for continuous columns
-    and standard one-hot encoding for categorical columns.
-
-    This preprocessor also collects metadata for conditional generation.
-    """
-    def __init__(self, n_components_gmm=10):
-        self.scalers = {}
-        self.gmms = {}
-        self.encoders = {}
-        self.categorical_columns = []
-        self.continuous_columns = []
-        self.n_components_gmm = n_components_gmm
-        self.is_fitted = False
-        self.column_info = [] # (col_name, type, original_dim, transformed_dim_start, transformed_dim_end)
-
-        # New: Metadata for conditional sampling
-        self.categorical_transformed_info = [] # (col_name, start_idx, end_idx, one_hot_size, value_counts_normalized)
-
-    def fit(self, data, categorical_columns=None):
-        """Fit preprocessors and collect metadata."""
-        self.categorical_columns = categorical_columns or []
-        self.continuous_columns = [col for col in data.columns if col not in self.categorical_columns]
-
-        current_transformed_dim = 0
-        self.column_info = [] # Reset column_info
-
-        for col in self.continuous_columns:
-            scaler = StandardScaler()
-            scaler.fit(data[col].values.reshape(-1, 1))
-            self.scalers[col] = scaler
-
-            gmm = GaussianMixture(n_components=self.n_components_gmm, random_state=42, covariance_type='full')
-            gmm.fit(scaler.transform(data[col].values.reshape(-1, 1)))
-            self.gmms[col] = gmm
-
-            self.column_info.append((col, 'continuous', 1, current_transformed_dim, current_transformed_dim + self.n_components_gmm + 1))
-            current_transformed_dim += (self.n_components_gmm + 1)
-
-        # Collect categorical metadata for conditional sampling
-        self.categorical_transformed_info = [] # Reset for refit
-        for col in self.categorical_columns:
-            encoder = LabelEncoder()
-            encoder.fit(data[col].astype(str))
-            self.encoders[col] = encoder
-            n_categories = len(self.encoders[col].classes_)
-
-            self.column_info.append((col, 'categorical', 1, current_transformed_dim, current_transformed_dim + n_categories))
-
-            # Store info for conditional sampling: name, start_idx, end_idx, num_categories, normalized frequencies
-            normalized_counts = data[col].value_counts(normalize=True).reindex(encoder.classes_, fill_value=0)
-            self.categorical_transformed_info.append({
-                'name': col,
-                'start_idx': current_transformed_dim,
-                'end_idx': current_transformed_dim + n_categories,
-                'num_categories': n_categories,
-                'proportions': normalized_counts.values
-            })
-            current_transformed_dim += n_categories
-
-        self.is_fitted = True
-        return self
-
-    def transform(self, data):
-        """Transform data to network-friendly format using mode-based approach for continuous."""
-        if not self.is_fitted:
-            raise ValueError("Preprocessor not fitted yet! Call .fit() first.")
-
-        transformed_data_parts = []
-        for col_name, col_type, _, _, _ in self.column_info: # Iterate based on fitted order
-            if col_type == 'continuous':
-                scaler = self.scalers[col_name]
-                gmm = self.gmms[col_name]
-
-                scaled_data = scaler.transform(data[col_name].values.reshape(-1, 1))
-                gmm_components = gmm.predict(scaled_data) # Use predict for hard assignment
-                gmm_means = gmm.means_[gmm_components]
-                gmm_covariances = gmm.covariances_[gmm_components]
-                gmm_stds = np.sqrt(gmm_covariances).reshape(-1, 1)
-                gmm_stds[gmm_stds == 0] = 1e-6
-                normalized_value_in_component = (scaled_data - gmm_means) / gmm_stds
-
-                one_hot_component = np.zeros((len(data), self.n_components_gmm))
-                one_hot_component[np.arange(len(data)), gmm_components] = 1
-
-                transformed_data_parts.append(one_hot_component)
-                transformed_data_parts.append(normalized_value_in_component)
-
-            elif col_type == 'categorical':
-                encoder = self.encoders[col_name]
-                encoded = encoder.transform(data[col_name].astype(str))
-                n_categories = len(encoder.classes_)
-                one_hot = np.zeros((len(encoded), n_categories))
-                one_hot[np.arange(len(encoded)), encoded] = 1
-                transformed_data_parts.append(one_hot)
-
-        return np.hstack(transformed_data_parts)
-
-    def inverse_transform(self, transformed_data):
-        """Convert transformed data back to original format."""
-        if not self.is_fitted:
-            raise ValueError("Preprocessor not fitted yet! Call .fit() first.")
-
-        reconstructed_data = {}
-        current_idx = 0
-
-        for col_name, col_type, original_dim, start_idx, end_idx in self.column_info:
-            if col_type == 'continuous':
-                component_one_hot = transformed_data[:, current_idx : current_idx + self.n_components_gmm]
-                normalized_value_in_component = transformed_data[:, current_idx + self.n_components_gmm : current_idx + self.n_components_gmm + 1]
-
-                gmm_components_pred = np.argmax(component_one_hot, axis=1)
-
-                scaler = self.scalers[col_name]
-                gmm = self.gmms[col_name]
-
-                gmm_means = gmm.means_[gmm_components_pred].reshape(-1,1)
-                gmm_covariances = gmm.covariances_[gmm_components_pred].reshape(-1,1)
-                gmm_stds = np.sqrt(gmm_covariances)
-                gmm_stds[gmm_stds == 0] = 1e-6
-
-                scaled_original_value = (normalized_value_in_component * gmm_stds) + gmm_means
-                original_col = scaler.inverse_transform(scaled_original_value)
-                reconstructed_data[col_name] = original_col.flatten()
-                current_idx += (self.n_components_gmm + 1)
-
-            elif col_type == 'categorical':
-                n_categories = len(self.encoders[col_name].classes_)
-                one_hot_cols = transformed_data[:, current_idx : current_idx + n_categories]
-                category_indices = np.argmax(one_hot_cols, axis=1)
-                original_categories = self.encoders[col_name].inverse_transform(category_indices)
-                reconstructed_data[col_name] = original_categories
-                current_idx += n_categories
-
-        return pd.DataFrame(reconstructed_data)
-
-    def get_output_dim(self):
-        """Get total dimension after preprocessing."""
-        dim = 0
-        for col_name, col_type, _, _, _ in self.column_info:
-            if col_type == 'continuous':
-                dim += (self.n_components_gmm + 1)
-            elif col_type == 'categorical':
-                dim += len(self.encoders[col_name].classes_)
-        return dim
-
-    def get_conditional_dim(self):
-        """Get total dimension of the conditional vector."""
-        # The conditional vector will be one-hot for one selected categorical feature at a time
-        # So its dimension is the max number of categories in any categorical column
-        if not self.categorical_transformed_info:
-            return 0
-        return max(info['num_categories'] for info in self.categorical_transformed_info)
-
-# --- CTGAN Class (replaces WGAN) ---
-class CTGAN:
-    """
-    CTGAN implementation for tabular data with conditional generation.
-    """
-    def __init__(self, preprocessor, noise_dim=100, lr=2e-4, lambda_gp=10, critic_iter=5):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.lambda_gp = lambda_gp
-        self.critic_iter = critic_iter
-
-        self.preprocessor = preprocessor
-        self.noise_dim = noise_dim
-        self.data_dim = self.preprocessor.get_output_dim()
-        self.cond_dim = self.preprocessor.get_conditional_dim()
-
-        # Initialize networks with conditional dimensions
-        self.generator = CTGANGenerator(self.noise_dim, self.data_dim, self.cond_dim).to(self.device)
-        self.critic = CTGANCritic(self.data_dim, self.cond_dim).to(self.device)
-
-        # Optimizers - Adam is typical for CTGAN
-        self.g_optimizer = optim.Adam(self.generator.parameters(), lr=lr, betas=(0.5, 0.9)) # CTGAN uses beta2=0.9
-        self.c_optimizer = optim.Adam(self.critic.parameters(), lr=lr, betas=(0.5, 0.9))
-
-        # Store categorical column indices for conditional sampling
-        self.categorical_transformed_info = preprocessor.categorical_transformed_info
-        self.num_categorical_cols = len(self.categorical_transformed_info)
-
-    def _sample_conditional_vector(self, batch_size):
-        """
-        Samples a conditional vector for a batch based on the CTGAN strategy.
-        Randomly picks one categorical column and a category within it based on frequencies.
-        """
-        if not self.categorical_transformed_info:
-            return torch.zeros(batch_size, self.cond_dim, device=self.device) # No categorical columns
-
-        # 1. Randomly pick a categorical column to condition on for this batch
-        # This could be a random choice or based on a fixed cycle for fairness
-        # For simplicity, let's pick randomly
-        selected_cond_info = np.random.choice(self.categorical_transformed_info)
-
-        # 2. Sample a specific category from that column based on its real data proportions
-        category_indices = np.random.choice(
-            a=np.arange(selected_cond_info['num_categories']),
-            size=batch_size,
-            p=selected_cond_info['proportions']
+class Generator(nn.Module):
+    def __init__(self, latent_dim, feature_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, feature_dim),
+            nn.Sigmoid()
         )
+    def forward(self, z):
+        return self.model(z)
+
+class Discriminator(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.model(x)
+
+def train_vanilla_gan(dataloader, latent_dim, feature_dim, device, s3_bucket, s3_prefix):
+    G = Generator(latent_dim, feature_dim).to(device)
+    D = Discriminator(feature_dim).to(device)
+
+    criterion = nn.BCELoss()
+    optimizer_G = optim.Adam(G.parameters(), lr=2e-4)
+    optimizer_D = optim.Adam(D.parameters(), lr=2e-4)
+
+    epochs = 50
+    for epoch in range(epochs):
+        for real_batch, in dataloader:
+            real_batch = real_batch.to(device)
+            batch_size = real_batch.size(0)
+
+            # Train Discriminator
+            optimizer_D.zero_grad()
+            real_labels = torch.ones((batch_size, 1), device=device)
+            fake_labels = torch.zeros((batch_size, 1), device=device)
+
+            output_real = D(real_batch)
+            loss_real = criterion(output_real, real_labels)
+
+            z = torch.randn(batch_size, latent_dim, device=device)
+            fake_data = G(z)
+            output_fake = D(fake_data.detach())
+            loss_fake = criterion(output_fake, fake_labels)
+
+            loss_D = loss_real + loss_fake
+            loss_D.backward()
+            optimizer_D.step()
+
+            # Train Generator
+            optimizer_G.zero_grad()
+            z = torch.randn(batch_size, latent_dim, device=device)
+            fake_data = G(z)
+            output = D(fake_data)
+            loss_G = criterion(output, real_labels)
+            loss_G.backward()
+            optimizer_G.step()
+
+        if (epoch + 1) % 10 == 0:
+            print(f"[Vanilla GAN] Epoch [{epoch+1}/{epochs}] Loss_D: {loss_D.item():.4f} Loss_G: {loss_G.item():.4f}")
+            save_model_to_s3(G, optimizer_G, epoch+1, s3_bucket, f"{s3_prefix}/vanilla_G_epoch{epoch+1}.pth")
+            save_model_to_s3(D, optimizer_D, epoch+1, s3_bucket, f"{s3_prefix}/vanilla_D_epoch{epoch+1}.pth")
+
+
+
+
+class Critic(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1)
+        )
+    def forward(self, x):
+        return self.model(x)
+
+def gradient_penalty(critic, real_data, fake_data, device):
+    batch_size = real_data.size(0)
+    epsilon = torch.rand(batch_size, 1, device=device)
+    epsilon = epsilon.expand_as(real_data)
+    interpolated = epsilon * real_data + (1 - epsilon) * fake_data
+    interpolated.requires_grad_(True)
+    mixed_scores = critic(interpolated)
+    grad_outputs = torch.ones_like(mixed_scores, device=device)
+    gradients = torch.autograd.grad(
+        outputs=mixed_scores,
+        inputs=interpolated,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True
+    )[0]
+    gradients = gradients.view(batch_size, -1)
+    grad_norm = gradients.norm(2, dim=1)
+    return ((grad_norm - 1) ** 2).mean()
+
+def train_wgan_gp(dataloader, latent_dim, feature_dim, device, s3_bucket, s3_prefix):
+    G = Generator(latent_dim, feature_dim).to(device)
+    C = Critic(feature_dim).to(device)
+
+    optimizer_G = optim.Adam(G.parameters(), lr=1e-4, betas=(0.0, 0.9))
+    optimizer_C = optim.Adam(C.parameters(), lr=1e-4, betas=(0.0, 0.9))
 
-        # 3. Create the one-hot conditional vector
-        cond_vector = torch.zeros(batch_size, self.cond_dim, device=self.device)
-
-        # The conditional vector's structure:
-        # It's one-hot for the chosen category within its column's part of the conditional vector.
-        # Other parts are zero.
-        # This implementation assumes cond_dim is max_num_categories across all categorical columns
-        # and that we put the one-hot for the selected category at the correct offset.
-        # This simplified `_sample_conditional_vector` for `cond_dim` is okay for now,
-        # but a more robust CTGAN implementation might concatenate all categorical one-hots if possible
-        # or use a specialized conditional vector creation.
-        # For this version, let's map the chosen category to the beginning of the cond_dim as a simple one-hot.
-        # More complex CTGANs may have a concatenated conditional vector that includes parts for all conditional columns.
-        # For simplicity, we just put the one-hot for the selected category in the first part of cond_dim.
-        # A more robust implementation would structure the `cond_dim` based on `preprocessor.column_info` too.
-
-        # For the purpose of this demo, we'll map chosen_category_index directly to cond_vector index
-        # This assumes the conditional vector is structured as one large one-hot,
-        # where indices correspond to original categorical values globally.
-        # A true CTGAN conditional vector is more nuanced, often a concatenation of individual
-        # categorical one-hots and padding.
-        # Let's use a simplified approach where cond_vector is a one-hot for the chosen category index.
-        # This requires `cond_dim` to be equal to `max_num_categories` across all categorical features.
-        # The correct index for the one-hot within `cond_vector` would be its global index.
-        # To make it work, `cond_dim` must be `sum(num_categories for all categorical cols)`.
-
-        # Re-evaluating cond_dim structure for CTGAN:
-        # CTGAN's conditional vector is usually constructed by taking the one-hot representation
-        # of *one* specific category and then padding it to match `cond_dim`.
-        # This `cond_dim` is often the sum of all one-hot sizes of categorical variables.
-        # For simplicity, let's assume `cond_dim` is just `max_num_categories` for the currently selected column.
-
-        # CTGAN original paper: Conditional vector is generated by sampling one column, one value.
-        # Then, this one-hot vector is concatenated to noise.
-        # `cond_dim` should thus be the max width of a one-hot category over all categorical columns.
-        # Or, the concatenated representation of all categorical columns' one-hots.
-        # Given the previous `get_conditional_dim`, let's assume `cond_dim` is `max_num_categories`.
-
-        # Simplified Conditional Vector for Demo:
-        # For this demo, let's assume `cond_dim` is simply the max number of categories of any single categorical column.
-        # And we just one-hot encode the sampled category into the first `num_categories` part of the cond_vector.
-        # This might not fully align with CTGAN's complex conditioning, but will demonstrate the principle.
-        
-        # Correct CTGAN conditional vector creation logic:
-        # 1. Choose a random categorical column to condition on.
-        # 2. Sample a specific category from that column.
-        # 3. Create a one-hot vector for *that specific category*.
-        # 4. Create a "mask" for the generator to only update non-conditioned parts.
-
-        # Let's adjust self.cond_dim calculation in init to be sum of all categorical one-hot sizes.
-        # And modify `_sample_conditional_vector` to create a truly sparse conditional vector for the Generator.
-
-        # New `_sample_conditional_vector` logic:
-        # It needs to return both the conditional vector and the index/mask of the conditioned column.
-        # This is because the Generator will receive the full conditional vector,
-        # but the Generator's loss calculation needs to know which parts were conditioned.
-
-        # The CTGAN paper suggests that for a batch, we sample (column_idx, category_idx)
-        # for each row. The conditional vector is built such that it's 1 at the (column_idx, category_idx)
-        # position and 0 everywhere else.
-
-        # Let's fix `preprocessor.get_conditional_dim()` to be the sum of all categorical one-hot sizes.
-        # This `cond_dim` will be the input to the Generator/Critic conditional layers.
-        # The `_sample_conditional_vector` will then create a one-hot vector of this `cond_dim` size.
-
-        total_cond_dim = 0
-        for info in self.categorical_transformed_info:
-            total_cond_dim += info['num_categories']
-        # This `total_cond_dim` should be the `self.cond_dim`
-
-        cond_vector_batch = torch.zeros(batch_size, total_cond_dim, device=self.device)
-        column_masks = torch.zeros(batch_size, self.data_dim, dtype=torch.bool, device=self.device) # Mask for Generator loss
-
-        for i in range(batch_size):
-            # Randomly select a categorical column to condition on for this sample
-            # CTGAN typically picks a column *proportionally* to its number of distinct values
-            # For simplicity, random uniform choice of column for now.
-            chosen_col_info_idx = np.random.randint(0, self.num_categorical_cols)
-            chosen_col_info = self.categorical_transformed_info[chosen_col_info_idx]
-
-            # Sample a category index from this chosen column's proportions
-            sampled_category_idx_local = np.random.choice(
-                a=np.arange(chosen_col_info['num_categories']),
-                p=chosen_col_info['proportions']
-            )
-            
-            # Place the one-hot in the correct position within the full conditional vector
-            global_cond_start_idx = 0
-            for k in range(chosen_col_info_idx):
-                global_cond_start_idx += self.categorical_transformed_info[k]['num_categories']
-            
-            cond_vector_batch[i, global_cond_start_idx + sampled_category_idx_local] = 1.0
-
-            # Create mask for generator loss: True for non-conditioned parts
-            # All other columns are non-conditioned, PLUS the continuous part of this column
-            # BUT the conditional vector's influence also affects the original one-hot part
-            # of the real data, which is needed to calculate the real data's actual output from generator.
-
-            # Simplified mask for now: mask out the entire transformed segment of the conditioned column
-            # This is to avoid penalizing generator for accurately recreating the input condition
-            column_masks[i, :] = True # Start with all true
-            column_masks[i, chosen_col_info['start_idx']:chosen_col_info['end_idx']] = False # Mask out the one-hot for this column
-
-
-        return cond_vector_batch, column_masks # Return conditional vector and mask
-
-
-    def gradient_penalty(self, real_data, fake_data, cond_vector):
-        """Calculates the gradient penalty for WGAN-GP with conditional input."""
-        batch_size = real_data.size(0)
-        epsilon = torch.rand(batch_size, 1, device=self.device)
-
-        interpolated = epsilon * real_data + (1 - epsilon) * fake_data
-        interpolated.requires_grad_(True)
-
-        critic_scores = self.critic(interpolated, cond_vector) # Pass conditional vector to critic
-
-        gradients = torch.autograd.grad(
-            outputs=critic_scores,
-            inputs=interpolated,
-            grad_outputs=torch.ones_like(critic_scores, device=self.device),
-            create_graph=True,
-            retain_graph=True
-        )[0]
-
-        gradients = gradients.view(batch_size, -1)
-        gradient_norm = gradients.norm(2, dim=1)
-
-        penalty = torch.mean((gradient_norm - 1) ** 2)
-
-        return penalty
-
-    def train_step(self, real_data_batch):
-        """Performs a single training step for the CTGAN."""
-        batch_size = real_data_batch.size(0)
-        real_data_batch = real_data_batch.to(self.device)
-
-        # NEW: Sample conditional vector and mask
-        cond_vector, column_mask_for_gen_loss = self._sample_conditional_vector(batch_size)
-
-        # Train Critic
-        for _ in range(self.critic_iter):
-            noise = torch.randn(batch_size, self.noise_dim, device=self.device)
-            # Pass conditional vector to generator
-            fake_data = self.generator(noise, cond_vector, self.preprocessor.column_info)
-
-            # Pass conditional vector to critic for both real and fake data
-            real_score = self.critic(real_data_batch, cond_vector)
-            fake_score = self.critic(fake_data.detach(), cond_vector)
-
-            # Calculate gradient penalty with conditional vector
-            gp = self.gradient_penalty(real_data_batch, fake_data, cond_vector)
-
-            c_loss = -real_score.mean() + fake_score.mean() + self.lambda_gp * gp
-
-            self.c_optimizer.zero_grad()
-            c_loss.backward()
-            self.c_optimizer.step()
-
-        # Train Generator
-        noise = torch.randn(batch_size, self.noise_dim, device=self.device)
-        # Generate new fake data with the same conditional vector
-        fake_data = self.generator(noise, cond_vector, self.preprocessor.column_info)
-        fake_score = self.critic(fake_data, cond_vector) # Pass conditional vector to critic for generator's score
-
-        # Generator loss: -E[D(G(z))]
-        # CTGAN also applies a mask to the generator's loss: only penalize for non-conditioned features
-        # This encourages the generator to correctly produce the conditioned features AND learn others
-        # by making it easy to reconstruct the conditional part.
-        g_loss_unmasked = -fake_score.mean()
-        
-        # CTGAN original loss masking:
-        # Instead of directly using fake_score.mean(), the loss is computed only on the non-conditioned
-        # parts of the generated data. This makes the generator's job easier for conditioned parts,
-        # allowing it to focus on learning the distribution of other columns *given* the condition.
-        # This requires carefully reconstructing the 'real' values corresponding to the conditional vector
-        # for the generator's output. For simplicity, we just apply the mask to the generated output
-        # to ensure the generator isn't penalized for getting the conditioned columns correct.
-
-        # A more direct CTGAN generator loss involves reconstructing the original data
-        # based on the conditional vector, and making the generator's output match that.
-        # For WGAN, it's about fooling the critic. The masking often applies to the *input*
-        # of the critic when evaluating real data, rather than directly modifying G loss in this manner.
-        # However, if we assume the `column_mask_for_gen_loss` indicates which parts the generator
-        # is `allowed` to deviate on (i.e., non-conditioned parts), then we can use it.
-
-        # For a standard WGAN-GP converted to CTGAN, the loss is still Wasserstein,
-        # but the *conditioning* itself is the mechanism to prevent mode collapse.
-        # The mask is more relevant for `CTGAN`'s specific architecture where some outputs are derived
-        # based on condition.
-        # For simplicity, let's keep the standard WGAN-GP generator loss, and rely on conditioning
-        # for performance improvement. The primary improvement comes from the conditional inputs.
-
-        g_loss = g_loss_unmasked # Using the standard WGAN-GP generator loss
-
-        self.g_optimizer.zero_grad()
-        g_loss.backward()
-        self.g_optimizer.step()
-
-        return {
-            'critic_loss': c_loss.item(),
-            'generator_loss': g_loss.item(),
-            'gradient_penalty': gp.item()
-        }
-
-    def generate_samples(self, n_samples):
-        """
-        Generate synthetic samples using the trained generator, iterating through conditions.
-        This generates `n_samples` for EACH distinct category in the first categorical column.
-        """
-        self.generator.eval()
-        all_synthetic_samples = []
-
-        # Iterate through all distinct categories of the *first* categorical column
-        # to ensure comprehensive generation.
-        # A more advanced CTGAN would allow generating for specific conditions or all combinations.
-        
-        if not self.preprocessor.categorical_transformed_info:
-            # If no categorical columns, generate unconditioned samples
-            print("No categorical columns for conditional generation. Generating unconditioned samples.")
-            with torch.no_grad():
-                noise = torch.randn(n_samples, self.noise_dim, device=self.device)
-                # Create a dummy cond_vector of zeros if no categorical columns
-                dummy_cond_vector = torch.zeros(n_samples, self.cond_dim, device=self.device)
-                fake_data = self.generator(noise, dummy_cond_vector, self.preprocessor.column_info)
-            all_synthetic_samples.append(fake_data.cpu().numpy())
-        else:
-            first_categorical_col_info = self.preprocessor.categorical_transformed_info[0]
-            num_categories_in_first_col = first_categorical_col_info['num_categories']
-
-            print(f"Generating samples conditioned on each of the {num_categories_in_first_col} categories in '{first_categorical_col_info['name']}'...")
-
-            for cat_idx in range(num_categories_in_first_col):
-                with torch.no_grad():
-                    noise = torch.randn(n_samples, self.noise_dim, device=self.device)
-                    
-                    # Create conditional vector for this specific category
-                    cond_vector_for_cat = torch.zeros(n_samples, self.cond_dim, device=self.device)
-                    # Correct global index mapping
-                    global_cond_start_idx = 0
-                    for k in range(0): # Loop up to first_categorical_col_info index (which is 0)
-                        global_cond_start_idx += self.preprocessor.categorical_transformed_info[k]['num_categories']
-
-                    cond_vector_for_cat[:, global_cond_start_idx + cat_idx] = 1.0
-
-                    fake_data = self.generator(noise, cond_vector_for_cat, self.preprocessor.column_info)
-                    all_synthetic_samples.append(fake_data.cpu().numpy())
-        
-        self.generator.train()
-        return np.vstack(all_synthetic_samples)
-
-
-    def save_model(self, path):
-        """
-        Saves the state dictionaries of the generator, critic, and their optimizers for CTGAN.
-        """
-        torch.save({
-            'generator_state_dict': self.generator.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'g_optimizer_state_dict': self.g_optimizer.state_dict(),
-            'c_optimizer_state_dict': self.c_optimizer.state_dict(),
-            'noise_dim': self.noise_dim,
-            'data_dim': self.data_dim, # Use self.data_dim which is preprocessor.get_output_dim()
-            'cond_dim': self.cond_dim,
-            'preprocessor_state': self.preprocessor # Save the preprocessor instance for full context
-        }, path)
-        print(f"CTGAN model state saved to: {path}")
-
-    @classmethod
-    def load_model(cls, path, lr=2e-4, lambda_gp=10, critic_iter=5):
-        """
-        Loads a CTGAN model from a saved state dictionary.
-        Requires the exact class definitions of CTGANGenerator, CTGANCritic, and TabularDataPreprocessor.
-        """
-        checkpoint = torch.load(path, map_location=torch.device('cpu'))
-
-        # Reconstruct preprocessor first
-        preprocessor = checkpoint['preprocessor_state']
-        if not isinstance(preprocessor, TabularDataPreprocessor):
-            raise TypeError("Loaded preprocessor is not an instance of TabularDataPreprocessor.")
-
-        # Extract dimensions
-        noise_dim = checkpoint['noise_dim']
-        data_dim = checkpoint['data_dim']
-        cond_dim = checkpoint['cond_dim']
-
-        # Create new CTGAN instance
-        loaded_ctgan = cls(preprocessor, noise_dim, lr, lambda_gp, critic_iter)
-
-        # Load state dictionaries
-        loaded_ctgan.generator.load_state_dict(checkpoint['generator_state_dict'])
-        loaded_ctgan.critic.load_state_dict(checkpoint['critic_state_dict'])
-        loaded_ctgan.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
-        loaded_ctgan.c_optimizer.load_state_dict(checkpoint['c_optimizer_state_dict'])
-
-        # Move to appropriate device
-        loaded_ctgan.generator.to(loaded_ctgan.device)
-        loaded_ctgan.critic.to(loaded_ctgan.device)
-
-        print(f"CTGAN model loaded from: {path}")
-        return loaded_ctgan
-
-
-def plot_gmm_fit(preprocessor, original_df, column_name):
-    """
-    Plots the histogram of the original data for a continuous column
-    and overlays the fitted Gaussian Mixture Model components.
-    """
-    if column_name not in preprocessor.continuous_columns:
-        print(f"Column '{column_name}' is not a continuous column or was not processed.")
-        return
-
-    data = original_df[column_name].values.reshape(-1, 1)
-    scaler = preprocessor.scalers[column_name]
-    gmm = preprocessor.gmms[column_name]
-
-    plt.figure(figsize=(8, 5))
-    plt.hist(data, bins=50, density=True, alpha=0.6, color='g', label='Original Data Histogram')
-
-    x = np.linspace(data.min(), data.max(), 500).reshape(-1, 1)
-    x_scaled = scaler.transform(x)
-
-    log_densities = gmm.score_samples(x_scaled)
-    densities = np.exp(log_densities)
-
-    plt.plot(x, densities, label='Overall GMM Density', color='red', linestyle='--', linewidth=2)
-
-    for i in range(gmm.n_components):
-        mean = gmm.means_[i][0]
-        std = np.sqrt(gmm.covariances_[i][0][0])
-        weight = gmm.weights_[i]
-
-        original_mean = scaler.inverse_transform(np.array([[mean]]))[0][0]
-        original_std = std * scaler.scale_[0]
-
-        component_pdf = scipy.stats.norm.pdf(x.flatten(), loc=original_mean, scale=original_std) * weight
-
-        plt.plot(x, component_pdf, linestyle=':', label=f'Component {i+1} (Weight: {weight:.2f})')
-
-    plt.title(f'GMM Fit for {column_name}')
-    plt.xlabel(column_name)
-    plt.ylabel('Density')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-def plot_categorical_distribution(real_df, synthetic_df, column_name):
-    """
-    Plots the distribution of a categorical column for real and synthetic data.
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    real_df[column_name].value_counts(normalize=True).plot(kind='bar', ax=axes[0], color='skyblue')
-    axes[0].set_title(f'Real {column_name} Distribution')
-    axes[0].set_ylabel('Proportion')
-    axes[0].tick_params(axis='x', rotation=45)
-
-    synthetic_df[column_name].value_counts(normalize=True).plot(kind='bar', ax=axes[1], color='lightcoral')
-    axes[1].set_title(f'Synthetic {column_name} Distribution')
-    axes[1].set_ylabel('Proportion')
-    axes[1].tick_params(axis='x', rotation=45)
-    plt.tight_layout()
-    plt.show()
-
-def plot_joint_distribution(real_df, synthetic_df, continuous_col, categorical_col):
-    """
-    Plots joint distributions (KDE plots) for a continuous and categorical column.
-    """
-    print(f"\nPlotting joint distribution for {continuous_col} by {categorical_col}...")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    # Real Data
-    sns.kdeplot(data=real_df, x=continuous_col, hue=categorical_col, fill=True, ax=axes[0])
-    axes[0].set_title(f'Real Data: {continuous_col} vs {categorical_col}')
-
-    # Synthetic Data
-    sns.kdeplot(data=synthetic_df, x=continuous_col, hue=categorical_col, fill=True, ax=axes[1])
-    axes[1].set_title(f'Synthetic Data: {continuous_col} vs {categorical_col}')
-
-    plt.tight_layout()
-    plt.show()
-
-
-# Example usage and testing
-def test_ctgan_mode_based():
-    """Test CTGAN Implementation for tabular data."""
-    print("Testing CTGAN Implementation for Tabular Data...")
-
-    n_samples = 2000
-    # Data with clear bimodal continuous distributions and multiple categorical
-    data = {
-        'age': np.concatenate([np.random.normal(25, 5, n_samples//2), np.random.normal(55, 7, n_samples//2)]),
-        'income': np.concatenate([np.random.normal(30000, 8000, n_samples//2), np.random.normal(80000, 12000, n_samples//2)]),
-        'education_level': np.random.choice(['High School', 'Bachelors', 'Masters', 'PhD'], n_samples, p=[0.2, 0.4, 0.3, 0.1]),
-        'marital_status': np.random.choice(['Single', 'Married', 'Divorced'], n_samples, p=[0.3, 0.6, 0.1]),
-        'children': np.random.randint(0, 4, n_samples)
-    }
-    df = pd.DataFrame(data)
-
-    # Use 2 components for age/income, matching their bimodal nature
-    preprocessor = TabularDataPreprocessor(n_components_gmm=2)
-    preprocessor.fit(df, categorical_columns=['education_level', 'marital_status', 'children'])
-
-    print("\n--- GMM Fits for Continuous Columns (Pre-Training) ---")
-    plot_gmm_fit(preprocessor, df, 'age')
-    plot_gmm_fit(preprocessor, df, 'income')
-
-    transformed_data = preprocessor.transform(df)
-    print(f"Original data shape: {df.shape}")
-    print(f"Transformed data shape (with GMM for continuous): {transformed_data.shape}")
-
-    # Initialize CTGAN
-    ctgan = CTGAN(preprocessor, noise_dim=100, lr=2e-4, lambda_gp=10, critic_iter=5)
-
-    batch_size = 256
-    dataset = TensorDataset(torch.FloatTensor(transformed_data))
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    print("\n--- Training CTGAN ---")
-    epochs = 5000 # CTGAN typically needs more epochs
-    log_interval = 100
-
-    c_losses = []
-    g_losses = []
-    gp_values = []
+    lambda_gp = 10
+    critic_iter = 5
+    epochs = 50
 
     for epoch in range(epochs):
-        for i, (real_data_batch,) in enumerate(dataloader):
-            losses = ctgan.train_step(real_data_batch)
-            c_losses.append(losses['critic_loss'])
-            g_losses.append(losses['generator_loss'])
-            gp_values.append(losses['gradient_penalty'])
+        for i, (real_batch,) in enumerate(dataloader):
+            real_batch = real_batch.to(device)
+            batch_size = real_batch.size(0)
 
-        if epoch % log_interval == 0:
-            avg_c_loss = np.mean(c_losses[-len(dataloader):])
-            avg_g_loss = np.mean(g_losses[-len(dataloader):])
-            avg_gp = np.mean(gp_values[-len(dataloader):])
-            print(f"Epoch {epoch}/{epochs}: C_Loss={avg_c_loss:.4f}, "
-                  f"G_Loss={avg_g_loss:.4f}, "
-                  f"GP={avg_gp:.4f}")
+            for _ in range(critic_iter):
+                z = torch.randn(batch_size, latent_dim, device=device)
+                fake_data = G(z)
+                crit_real = C(real_batch).mean()
+                crit_fake = C(fake_data.detach()).mean()
+                gp = gradient_penalty(C, real_batch, fake_data, device)
+                loss_C = -(crit_real - crit_fake) + lambda_gp * gp
+                optimizer_C.zero_grad()
+                loss_C.backward()
+                optimizer_C.step()
 
-    # --- Save the trained CTGAN model ---
-    model_save_dir = "saved_models"
-    os.makedirs(model_save_dir, exist_ok=True)
-    model_path = os.path.join(model_save_dir, f"ctgan_tabular_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth")
-    ctgan.save_model(model_path)
+            z = torch.randn(batch_size, latent_dim, device=device)
+            fake_data = G(z)
+            loss_G = -C(fake_data).mean()
+            optimizer_G.zero_grad()
+            loss_G.backward()
+            optimizer_G.step()
 
-    # --- Load the model (demonstration) ---
-    print("\n--- Demonstrating Model Loading ---")
-    loaded_ctgan = CTGAN.load_model(model_path)
+        if (epoch + 1) % 10 == 0:
+            print(f"[WGAN-GP] Epoch [{epoch+1}/{epochs}] Loss_C: {loss_C.item():.4f} Loss_G: {loss_G.item():.4f}")
+            save_model_to_s3(G, optimizer_G, epoch+1, s3_bucket, f"{s3_prefix}/wgan_G_epoch{epoch+1}.pth")
+            save_model_to_s3(C, optimizer_C, epoch+1, s3_bucket, f"{s3_prefix}/wgan_C_epoch{epoch+1}.pth")
 
-    # Generate samples from the trained model
-    # CTGAN generation is typically done by generating for each condition
-    synthetic_samples_np = ctgan.generate_samples(n_samples // len(preprocessor.categorical_columns) + 1) # Generate more for diversity
-    synthetic_df = preprocessor.inverse_transform(synthetic_samples_np)
 
-    print("\n--- Comparison of Real vs. Synthetic Data (CTGAN Performance) ---")
-    print("\nOriginal data stats:")
-    print(df.describe(include='all'))
-    print(f"\nSynthetic data stats (after CTGAN training):")
-    print(synthetic_df.describe(include='all'))
 
-    # Visual comparison for continuous features
-    print("\nPlotting continuous distribution comparisons...")
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
-    sns.histplot(df['age'], bins=30, kde=True, color='skyblue', label='Real Age', stat='density')
-    sns.histplot(synthetic_df['age'], bins=30, kde=True, color='lightcoral', label='Synthetic Age', stat='density')
-    plt.title('Age Distribution Comparison (CTGAN)')
-    plt.legend()
+########WGAN
+class Critic(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1)
+        )
+    def forward(self, x):
+        return self.model(x)
 
-    plt.subplot(1, 2, 2)
-    sns.histplot(df['income'], bins=30, kde=True, color='skyblue', label='Real Income', stat='density')
-    sns.histplot(synthetic_df['income'], bins=30, kde=True, color='lightcoral', label='Synthetic Income', stat='density')
-    plt.title('Income Distribution Comparison (CTGAN)')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+def gradient_penalty(critic, real_data, fake_data, device):
+    batch_size = real_data.size(0)
+    epsilon = torch.rand(batch_size, 1, device=device)
+    epsilon = epsilon.expand_as(real_data)
+    interpolated = epsilon * real_data + (1 - epsilon) * fake_data
+    interpolated.requires_grad_(True)
+    mixed_scores = critic(interpolated)
+    grad_outputs = torch.ones_like(mixed_scores, device=device)
+    gradients = torch.autograd.grad(
+        outputs=mixed_scores,
+        inputs=interpolated,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True
+    )[0]
+    gradients = gradients.view(batch_size, -1)
+    grad_norm = gradients.norm(2, dim=1)
+    return ((grad_norm - 1) ** 2).mean()
 
-    # Visual comparison for categorical features
-    print("\nPlotting categorical distribution comparisons...")
-    plot_categorical_distribution(df, synthetic_df, 'education_level')
-    plot_categorical_distribution(df, synthetic_df, 'marital_status')
-    plot_categorical_distribution(df, synthetic_df, 'children')
+def train_wgan_gp(dataloader, latent_dim, feature_dim, device, s3_bucket, s3_prefix):
+    G = Generator(latent_dim, feature_dim).to(device)
+    C = Critic(feature_dim).to(device)
 
-    # Plot joint distributions to show conditional learning
-    print("\nPlotting joint distribution comparisons (CTGAN strength)...")
-    plot_joint_distribution(df, synthetic_df, 'age', 'education_level')
-    plot_joint_distribution(df, synthetic_df, 'income', 'marital_status')
+    optimizer_G = optim.Adam(G.parameters(), lr=1e-4, betas=(0.0, 0.9))
+    optimizer_C = optim.Adam(C.parameters(), lr=1e-4, betas=(0.0, 0.9))
 
-    # Plotting losses
-    plt.figure(figsize=(10, 6))
-    plt.plot(c_losses, label='Critic Loss')
-    plt.plot(g_losses, label='Generator Loss')
-    plt.plot(gp_values, label='Gradient Penalty')
-    plt.title('CTGAN Training Losses')
-    plt.xlabel('Training Iteration (Batch)')
-    plt.ylabel('Loss Value')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    lambda_gp = 10
+    critic_iter = 5
+    epochs = 50
 
-    print("\n--- CTGAN Performance Analysis Summary ---")
-    print("Observations:")
-    print("1. Continuous Features: CTGAN, with its conditional generation, should show improved fidelity in replicating multi-modal continuous distributions, often showing more distinct peaks closer to the real data.")
-    print("2. Categorical Features: The generator is forced to generate all categories more accurately, leading to better proportional representation in synthetic data, reducing mode collapse on categorical columns.")
-    print("3. Inter-feature Dependencies (Correlations): This is where CTGAN excels. By conditioning, it learns the relationships (e.g., how 'age' distribution changes for different 'education_level' categories). The joint distribution plots should look much more similar between real and synthetic data.")
-    print("\nConclusion: While WGAN-GP provides stable training, its lack of explicit conditional guidance for mixed-type tabular data often leads to mode collapse and poor replication of inter-feature dependencies. CTGAN directly addresses these by introducing conditional generation and specialized categorical handling, leading to significantly better performance in generating high-fidelity tabular synthetic data.")
+    for epoch in range(epochs):
+        for i, (real_batch,) in enumerate(dataloader):
+            real_batch = real_batch.to(device)
+            batch_size = real_batch.size(0)
 
-if __name__ == "__main__":
-    test_ctgan_mode_based()
+            for _ in range(critic_iter):
+                z = torch.randn(batch_size, latent_dim, device=device)
+                fake_data = G(z)
+                crit_real = C(real_batch).mean()
+                crit_fake = C(fake_data.detach()).mean()
+                gp = gradient_penalty(C, real_batch, fake_data, device)
+                loss_C = -(crit_real - crit_fake) + lambda_gp * gp
+                optimizer_C.zero_grad()
+                loss_C.backward()
+                optimizer_C.step()
+
+            z = torch.randn(batch_size, latent_dim, device=device)
+            fake_data = G(z)
+            loss_G = -C(fake_data).mean()
+            optimizer_G.zero_grad()
+            loss_G.backward()
+            optimizer_G.step()
+
+        if (epoch + 1) % 10 == 0:
+            print(f"[WGAN-GP] Epoch [{epoch+1}/{epochs}] Loss_C: {loss_C.item():.4f} Loss_G: {loss_G.item():.4f}")
+            save_model_to_s3(G, optimizer_G, epoch+1, s3_bucket, f"{s3_prefix}/wgan_G_epoch{epoch+1}.pth")
+            save_model_to_s3(C, optimizer_C, epoch+1, s3_bucket, f"{s3_prefix}/wgan_C_epoch{epoch+1}.pth")
