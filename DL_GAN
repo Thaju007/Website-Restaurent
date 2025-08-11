@@ -247,6 +247,83 @@ def train_wgan_gp(dataloader, latent_dim, feature_dim, device, s3_bucket, s3_pre
             loss_G.backward()
             optimizer_G.step()
 
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+
+class TabularDataTransformer:
+    def __init__(self):
+        self.continuous_cols = []
+        self.categorical_cols = []
+        self.scalers = {}
+        self.encoders = {}
+        self.column_order = []
+    
+    def fit(self, df, categorical_cols, continuous_cols):
+        """
+        Fit the transformer on the dataset.
+        """
+        self.categorical_cols = categorical_cols
+        self.continuous_cols = continuous_cols
+        self.column_order = categorical_cols + continuous_cols
+        
+        # Fit encoders for categorical columns
+        for col in categorical_cols:
+            enc = OneHotEncoder(sparse=False, handle_unknown='ignore')
+            enc.fit(df[[col]])
+            self.encoders[col] = enc
+        
+        # Fit scalers for continuous columns
+        for col in continuous_cols:
+            scaler = MinMaxScaler(feature_range=(-1, 1))
+            scaler.fit(df[[col]])
+            self.scalers[col] = scaler
+    
+    def transform(self, df):
+        """
+        Transform the dataset into numeric tensors for GAN training.
+        """
+        transformed_data = []
+        
+        # Transform categorical columns
+        for col in self.categorical_cols:
+            ohe = self.encoders[col].transform(df[[col]])
+            transformed_data.append(ohe)
+        
+        # Transform continuous columns
+        for col in self.continuous_cols:
+            scaled = self.scalers[col].transform(df[[col]])
+            transformed_data.append(scaled)
+        
+        return np.hstack(transformed_data).astype(np.float32)
+    
+    def inverse_transform(self, data):
+        """
+        Convert model-generated numeric data back to original column format.
+        """
+        df_out = pd.DataFrame()
+        start_idx = 0
+        
+        # Inverse transform categorical
+        for col in self.categorical_cols:
+            enc = self.encoders[col]
+            ohe_len = len(enc.categories_[0])
+            ohe_data = data[:, start_idx:start_idx+ohe_len]
+            start_idx += ohe_len
+            labels = enc.inverse_transform(ohe_data)
+            df_out[col] = labels.ravel()
+        
+        # Inverse transform continuous
+        for col in self.continuous_cols:
+            scaler = self.scalers[col]
+            col_data = data[:, start_idx:start_idx+1]
+            start_idx += 1
+            df_out[col] = scaler.inverse_transform(col_data).ravel()
+        
+        return df_out
+
+
         if (epoch + 1) % 10 == 0:
             print(f"[WGAN-GP] Epoch [{epoch+1}/{epochs}] Loss_C: {loss_C.item():.4f} Loss_G: {loss_G.item():.4f}")
             save_model_to_s3(G, optimizer_G, epoch+1, s3_bucket, f"{s3_prefix}/wgan_G_epoch{epoch+1}.pth")
