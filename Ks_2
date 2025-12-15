@@ -1,0 +1,121 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import entropy
+
+# =========================
+# CONFIG
+# =========================
+BINARY_ENTROPY_THRESHOLD = 0.10
+CATEGORICAL_ENTROPY_THRESHOLD = 0.25
+CONTINUOUS_ENTROPY_THRESHOLD = 0.30
+MAX_CATEGORIES = 50          # beyond this → treat as continuous
+N_BINS = 10                  # quantile bins for continuous vars
+
+
+# =========================
+# ENTROPY FUNCTION
+# =========================
+def compute_entropy(series):
+    """
+    Computes Shannon entropy for a pandas Series.
+    Ignores NaNs.
+    """
+    value_probs = series.value_counts(normalize=True, dropna=True)
+    return entropy(value_probs)
+
+
+# =========================
+# VARIABLE TYPE DETECTION
+# =========================
+def detect_variable_types(df):
+    binary_cols = []
+    categorical_cols = []
+    continuous_cols = []
+
+    for col in df.columns:
+        nunique = df[col].nunique(dropna=True)
+
+        if nunique <= 1:
+            continue
+        elif nunique == 2:
+            binary_cols.append(col)
+        elif 2 < nunique <= MAX_CATEGORIES:
+            categorical_cols.append(col)
+        else:
+            continuous_cols.append(col)
+
+    return binary_cols, categorical_cols, continuous_cols
+
+
+# =========================
+# ENTROPY CALCULATION PIPELINE
+# =========================
+def entropy_variable_reduction(df):
+    """
+    Returns:
+    - reduced dataframe
+    - entropy score dataframe
+    """
+
+    df = df.copy()
+
+    # Detect variable types
+    binary_cols, categorical_cols, continuous_cols = detect_variable_types(df)
+
+    entropy_scores = []
+
+    # -------------------------
+    # Binary & Categorical
+    # -------------------------
+    for col in binary_cols + categorical_cols:
+        try:
+            df[col] = df[col].astype("category")
+            h = compute_entropy(df[col])
+            entropy_scores.append((col, h))
+        except Exception:
+            entropy_scores.append((col, 0))
+
+    # -------------------------
+    # Continuous (Binned)
+    # -------------------------
+    for col in continuous_cols:
+        try:
+            binned = pd.qcut(df[col], q=N_BINS, duplicates="drop")
+            h = compute_entropy(binned)
+            entropy_scores.append((col, h))
+        except Exception:
+            entropy_scores.append((col, 0))
+
+    entropy_df = pd.DataFrame(
+        entropy_scores,
+        columns=["variable", "entropy"]
+    ).sort_values("entropy", ascending=False)
+
+    # -------------------------
+    # Apply Thresholds
+    # -------------------------
+    selected_vars = []
+
+    for _, row in entropy_df.iterrows():
+        col = row["variable"]
+        h = row["entropy"]
+
+        if col in binary_cols and h >= BINARY_ENTROPY_THRESHOLD:
+            selected_vars.append(col)
+        elif col in categorical_cols and h >= CATEGORICAL_ENTROPY_THRESHOLD:
+            selected_vars.append(col)
+        elif col in continuous_cols and h >= CONTINUOUS_ENTROPY_THRESHOLD:
+            selected_vars.append(col)
+
+    df_reduced = df[selected_vars]
+
+    return df_reduced, entropy_df
+
+
+# =========================
+# RUN
+# =========================
+df_reduced, entropy_table = entropy_variable_reduction(df)
+
+print(f"Original variables: {df.shape[1]}")
+print(f"Selected variables: {df_reduced.shape[1]}")
