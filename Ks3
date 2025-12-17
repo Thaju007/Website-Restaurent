@@ -1,0 +1,155 @@
+# =========================================
+# PRIZM STYLE END-TO-END SEGMENTATION
+# =========================================
+
+import numpy as np
+import pandas as pd
+from scipy.stats import entropy
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.metrics import silhouette_score
+
+# -----------------------------------------
+# STEP 1: FEATURE ENGINEERING
+# -----------------------------------------
+def create_prizm_features(df):
+
+    df = df.copy()
+
+    # Household structure
+    df["hh_size"] = df["num_adults"] + df["num_children"]
+    df["kids_flag"] = (df["num_children"] > 0).astype(int)
+    df["large_hh_flag"] = (df["hh_size"] >= 5).astype(int)
+
+    adults = df["num_adults"].replace(0, np.nan)
+    hh_size = df["hh_size"].replace(0, np.nan)
+
+    # Dependency & burden
+    df["dependency_ratio"] = df["num_children"] / adults
+    df["adult_child_balance"] = adults / (df["num_children"] + 1)
+    df["burden_index"] = df["dependency_ratio"] * df["hh_size"]
+    df["economic_pressure_index"] = (df["num_children"] * 1.0) + (df["hh_size"] * 0.5)
+
+    # Income normalization
+    df["income_per_adult"] = df["hh_income"] / adults
+    df["income_per_capita"] = df["hh_income"] / hh_size
+    df["income_adjusted_for_kids"] = df["hh_income"] / (1 + 0.7 * df["num_children"])
+
+    # Life-stage flags
+    df["single_adult_flag"] = ((df["num_adults"] == 1) & (df["num_children"] == 0)).astype(int)
+    df["couple_no_kids_flag"] = ((df["num_adults"] == 2) & (df["num_children"] == 0)).astype(int)
+    df["single_parent_flag"] = ((df["num_adults"] == 1) & (df["num_children"] > 0)).astype(int)
+    df["young_family_flag"] = ((df["num_adults"] >= 2) & (df["num_children"] == 1)).astype(int)
+    df["large_family_flag"] = (df["hh_size"] >= 5).astype(int)
+
+    # Stress / affluence signals
+    income_pc_median = df["income_per_capita"].median()
+
+    df["high_dependency_flag"] = (df["dependency_ratio"] > 1).astype(int)
+    df["high_income_large_family_flag"] = (
+        (df["income_per_capita"] > income_pc_median) & (df["hh_size"] >= 4)
+    ).astype(int)
+
+    df["low_income_high_burden_flag"] = (
+        (df["income_per_capita"] < income_pc_median) &
+        (df["burden_index"] > df["burden_index"].median())
+    ).astype(int)
+
+    return df
+
+
+# -----------------------------------------
+# STEP 2: HARD FILTER
+# -----------------------------------------
+def hard_filter(df, missing_thr=0.7, dominance_thr=0.95):
+    drop_cols = []
+    for col in df.columns:
+        if df[col].isna().mean() > missing_thr:
+            drop_cols.append(col)
+            continue
+        vc = df[col].value_counts(normalize=True, dropna=True)
+        if len(vc) > 0 and vc.iloc[0] > dominance_thr:
+            drop_cols.append(col)
+    return df.drop(columns=drop_cols)
+
+
+# -----------------------------------------
+# STEP 3: ENTROPY FILTER
+# -----------------------------------------
+def entropy_score(series, bins=10):
+    x = series.dropna()
+    if x.nunique() <= 1:
+        return 0
+    counts, _ = np.histogram(x, bins=bins)
+    probs = counts / counts.sum()
+    return entropy(probs)
+
+def entropy_filter(df, min_entropy=0.3):
+    ent = {c: entropy_score(df[c]) for c in df.columns}
+    ent_df = pd.Series(ent)
+    keep_cols = ent_df[ent_df >= min_entropy].index
+    return df[keep_cols]
+
+
+# -----------------------------------------
+# STEP 4: REDUNDANCY FILTER
+# -----------------------------------------
+def drop_high_corr(df, corr_thr=0.85):
+    corr = df.corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    drop_cols = [c for c in upper.columns if any(upper[c] > corr_thr)]
+    return df.drop(columns=drop_cols)
+
+
+# -----------------------------------------
+# STEP 5: CLUSTER RELEVANCE FILTER
+# -----------------------------------------
+def cluster_relevance_filter(df, top_n=80):
+    X = StandardScaler().fit_transform(df)
+    labels = MiniBatchKMeans(n_clusters=12, random_state=42, batch_size=5000).fit_predict(X)
+
+    relevance = {}
+    for col in df.columns:
+        relevance[col] = df.groupby(labels)[col].mean().var()
+
+    rel = pd.Series(relevance).sort_values(ascending=False)
+    return df[rel.head(top_n).index]
+
+
+# -----------------------------------------
+# STEP 6: FULL PIPELINE
+# -----------------------------------------
+def prizm_segmentation_pipeline(df, k=28):
+
+    df = create_prizm_features(df)
+    df = hard_filter(df)
+    df = entropy_filter(df)
+    df = drop_high_corr(df)
+    df = cluster_relevance_filter(df)
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df)
+
+    model = MiniBatchKMeans(
+        n_clusters=k,
+        random_state=42,
+        batch_size=5000
+    )
+    labels = model.fit_predict(X)
+
+    df["segment_id"] = labels
+
+    print("\nCluster size distribution:")
+    print(df["segment_id"].value_counts(normalize=True))
+
+    print("\nSilhouette score:")
+    print(silhouette_score(X, labels))
+
+    return df
+
+
+# -----------------------------------------
+# USAGE
+# -----------------------------------------
+# df = pd.read_csv("your_data.csv")
+# segmented_df = prizm_segmentation_pipeline(df, k=28)
